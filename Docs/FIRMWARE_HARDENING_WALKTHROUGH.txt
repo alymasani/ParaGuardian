@@ -1,0 +1,550 @@
+===============================================================================
+ PARAGUARDIAN FIRMWARE HARDENING WALKTHROUGH
+ What changed in the reliability audit, why, and how it was checked
+===============================================================================
+
+Audience : an engineering student learning embedded programming. Read the
+           companion PARAGUARDIAN_FIRMWARE_WALKTHROUGH.txt first.
+Status   : 2026-11-17. Everything here compiles (CubeIDE Debug + Release,
+           0 errors, 0 warnings) and passes 120 host tests (with address,
+           undefined-behaviour and thread sanitizers). NOTHING has run on
+           real hardware.
+AI note  : produced with Claude Code (AI assistant) at the student's request;
+           review and own it before relying on it.
+
+CONTENTS
+  A  The frozen clock before the scheduler (HalTickFallback, RtosClock)
+  B  Keeping the 10 ms sampling loop on time (magnetometer, init budget,
+     retries, re-init, missed deadlines, UART buffer)
+  C  Getting fresh data to the right consumer (overflow policies, mailbox,
+     freshness and sequence tracking)
+  D  Catching stack overflows and out-of-memory (FreeRTOS hooks, reset cause)
+  E  CMSIS-V2 / SoarOS re-check (nothing changed - and why)
+  F  CubeMX regeneration checklist
+  G  How the tests were built
+  H  What still needs hardware
+
+
+===============================================================================
+A. THE FROZEN CLOCK BEFORE THE SCHEDULER
+===============================================================================
+
+A.1 The idea in plain words
+---------------------------
+The HAL keeps time with a counter called uwTick. A hardware timer (TIM6)
+raises an interrupt every millisecond and the interrupt adds 1 to uwTick.
+HAL functions that "wait at most 100 ms" read uwTick (through HAL_GetTick())
+in a loop until it has moved on by 100.
+
+Before FreeRTOS starts running tasks, FreeRTOS deliberately blocks most
+interrupts the moment any FreeRTOS function is used. SoarOS uses one before
+main() even starts (it creates a mutex in a global object). So from the very
+first line of main() until the scheduler starts, the TIM6 interrupt cannot
+run, uwTick never changes, and any "wait at most 100 ms" loop could wait
+forever.
+
+A.2 The technical evidence (short version)
+------------------------------------------
+- Startup assembly: "bl __libc_init_array" (runs C++ global constructors)
+  happens before "bl main".
+- The only C++ global constructor in the image builds SoarOS's
+  Global::vaListMutex, which calls xQueueCreateMutex().
+- FreeRTOS port.c:  static UBaseType_t uxCriticalNesting = 0xaaaaaaaa;
+  Entering a critical section raises BASEPRI (an "interrupt priority floor"
+  register) and adds 1; leaving subtracts 1 and only lowers BASEPRI when the
+  count is 0. Starting from 0xaaaaaaaa it never reaches 0, so BASEPRI stays at
+  priority 5 until the first task starts.
+- BASEPRI = 5 blocks every interrupt whose priority number is 5 or higher.
+  TIM6 is 15 -> blocked.
+
+A.3 The fix: Components/SysCore/HalTickFallback.cpp, function HAL_GetTick()
+--------------------------------------------------------------------------
+Purpose: return the HAL millisecond count, and make it keep counting even
+when the TIM6 interrupt is blocked.
+Parameters: none. Returns: uwTick (milliseconds since HAL_Init).
+
+    extern TIM_HandleTypeDef htim6;
+  htim6 is the TIM6 handle CubeMX created in stm32h7xx_hal_timebase_tim.c.
+  "extern" says "this variable exists in another file". If the time base is
+  ever changed to another timer, htim6 disappears and the LINK fails - a loud
+  error instead of silently watching the wrong timer.
+
+    extern "C" uint32_t HAL_GetTick(void)
+  HAL declares HAL_GetTick() as __weak (a "default" the linker throws away if
+  anyone else defines the same function). extern "C" gives our C++ function
+  the plain C name the HAL calls. Result: every HAL_GetTick() call in the
+  firmware now runs our version (confirmed in the linked image with nm).
+
+    TIM_TypeDef* const tim = htim6.Instance;
+  The register block of TIM6 (a pointer to memory-mapped hardware).
+
+    if (tim != nullptr && (tim->CR1 & TIM_CR1_CEN) != 0u &&
+  Only if HAL_Init() has already started TIM6 (CEN = counter enable bit).
+
+        pg::interruptBlockedByMask(__get_PRIMASK(), __get_BASEPRI(),
+                                   NVIC_GetPriority(TIM6_DAC_IRQn), __NVIC_PRIO_BITS) &&
+  Ask: "can the TIM6 interrupt run right now?" (rules in A.4).
+  __get_PRIMASK/__get_BASEPRI are CMSIS functions that read CPU registers.
+
+        (tim->SR & TIM_SR_UIF) != 0u) {
+  UIF = "update interrupt flag": the hardware sets it every 1 ms when the
+  counter wraps. It stays set until someone clears it.
+
+        tim->SR = ~TIM_SR_UIF;
+  Clear ONLY the UIF bit. The status register bits are "rc_w0": writing 0
+  clears a bit, writing 1 leaves it alone. ~TIM_SR_UIF is all ones except a 0
+  at UIF, so only UIF is cleared. (A read-modify-write "SR &= ~UIF" could
+  accidentally clear a flag that the hardware set between the read and the
+  write.)
+
+        HAL_IncTick();
+  Exactly what the interrupt would have done: uwTick += 1.
+
+    return uwTick;
+
+Why this is safe:
+- It never changes an interrupt mask (the obvious alternative, clearing
+  BASEPRI, would interfere with FreeRTOS's deliberate protection).
+- No double counting: the poll only runs while the interrupt CANNOT run, and
+  when the interrupt later runs it re-reads SR and finds UIF already 0.
+- The clock can only be slow (at most one tick per call), never fast, so a
+  timeout is never shorter than requested. While code is in a wait loop it
+  calls HAL_GetTick() constantly, so in practice it keeps up.
+- Cost when nothing is masked (normal operation): three register reads.
+Concurrency: single core; the interrupt and this code cannot run at the same
+time while the interrupt is masked, so uwTick has a single writer.
+How it was tested: the decision rule (A.4) has a host test with the real
+register values. The register polling itself needs the chip: on hardware,
+g_systemHealth.tickFallbackIncrements > 0 confirms it ran.
+
+A.4 Components/Common/InterruptMask.hpp, function interruptBlockedByMask()
+--------------------------------------------------------------------------
+    constexpr bool interruptBlockedByMask(uint32_t primask, uint32_t basepri,
+                                          uint32_t irqPriority, uint32_t prioBits)
+    {
+        if ((primask & 1u) != 0u) return true;          // all interrupts off
+        if ((basepri & 0xFFu) == 0u) return false;       // BASEPRI 0 = no floor
+        const uint32_t shiftedPriority = (irqPriority << (8u - prioBits)) & 0xFFu;
+        return shiftedPriority >= (basepri & 0xFFu);
+    }
+Plain words: lower number = more urgent. BASEPRI blocks everything at or
+below its urgency. The STM32H7 uses only the top 4 bits of each 8-bit
+priority field, so priority 15 is stored as 15 << 4 = 0xF0 and BASEPRI 5 as
+0x50. 0xF0 >= 0x50 -> TIM6 blocked; priority 4 (0x40) would still run.
+It is "constexpr" and has no hardware includes, so the laptop tests can call
+it (test audit_a_basepri_masks_tim6_before_scheduler).
+
+A.5 Components/BSP/RtosClock.cpp - millis() and delayMs()
+---------------------------------------------------------
+Before:
+    millis(): return xTaskGetTickCount() ...       // FreeRTOS tick: 0 until scheduler starts
+    delayMs(): vTaskDelay(...) or busyWaitMs()      // DWT cycle-counter loop
+Problems: (1) a driver timeout "(millis() - start) >= timeout" could never
+finish before the scheduler, because millis() stayed 0; (2) on Cortex-M7 the
+DWT cycle counter may need a software unlock (DWT->LAR = 0xC5ACCE55) before
+it counts without a debugger; the loop had no unlock and no "counter not
+moving" guard, so it could wait forever on a production board.
+After:
+    uint32_t RtosClock::millis() { return HAL_GetTick(); }
+    void RtosClock::delayMs(uint32_t ms) {
+        if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
+            vTaskDelay(pdMS_TO_TICKS(ms) + 1u);   // let other tasks run
+        } else {
+            HAL_Delay(ms);                         // bounded thanks to A.3
+        }
+    }
+One time base from boot to power-off; no jump when the scheduler starts.
+HAL_Delay() is also __weak in the HAL; we did not replace it - it simply calls
+our HAL_GetTick() in its loop.
+
+
+===============================================================================
+B. KEEPING THE 10 MS SAMPLING LOOP ON TIME
+===============================================================================
+
+B.1 The idea in plain words
+---------------------------
+One task wakes every 10 ms and reads every sensor that is due. If any single
+read takes most of 10 ms, the loop is late. The audit found three ways that
+could happen: the magnetometer read waited for its conversion, failing
+sensors re-tried their slow start-up all in the same cycle, and a sensor that
+broke after start-up was never restarted.
+
+B.2 Magnetometer: from "wait" to "start now, collect later"
+-----------------------------------------------------------
+File: Components/Sensors/MMC5983MA/Mmc5983ma.cpp
+
+The old measure() did: start conversion -> loop { read STATUS; sleep 1 ms }
+until done. A 100 Hz-bandwidth conversion takes 8 ms, so each call blocked
+8-9 ms. Test audit_b_old_blocking_mag_measure_consumes_cycle reproduces it.
+
+New function 1: Status Mmc5983ma::startMeasurement()
+    if (!health_.initialized) return Status::NotInitialized;
+    if (measurementPending_)  return Status::Busy;      // one at a time
+    Status s = bus_.writeRegister(REG_STATUS, STATUS_MEAS_M_DONE);   // clear old "done" (write 1 to clear)
+    if (isOk(s)) s = bus_.writeRegister(REG_CTRL0, ctrl0Persistent_ | CTRL0_TM_M);  // start
+    ...
+    measurementPending_ = true;
+    measurementStartMs_ = clock_.millis();
+Two register writes (~tens of microseconds) and return.
+
+New function 2: Status Mmc5983ma::readMeasurementIfReady(MagSample& out)
+    if (!measurementPending_) return Status::NotReady;          // nothing started
+    Status s = bus_.readRegister(REG_STATUS, status);           // ONE status read
+    if ((status & STATUS_MEAS_M_DONE) == 0u) {                  // not finished yet
+        if ((clock_.millis() - measurementStartMs_) >= measurementTimeoutMs()) {
+            measurementPending_ = false;
+            return track(Status::Timeout);                       // gave up: counted as a fault
+        }
+        return Status::NotReady;                                 // normal: try next cycle
+    }
+    measurementPending_ = false;
+    ... read the 7 data registers, convert, return Ok
+Important ordering detail: the "done" flag is checked BEFORE the timeout. If
+the loop was late and polls 25 ms after the start, a finished conversion is
+still accepted (test audit_b_mag_late_poll_of_finished_conversion_is_not_a_timeout).
+The blocking measure() still exists for code that wants it (e.g. bench tools).
+
+Glue: Components/Acquisition/AcquisitionSources.cpp, class MagSource
+    Status MagSource::readAndPublish(ISampleSink&) { return mag_.startMeasurement(); }
+    bool hasPendingWork() const override { return mag_.measurementPending(); }
+    Status MagSource::continuePending(ISampleSink& sink) {
+        const Status st = mag_.readMeasurementIfReady(s);
+        if (st == Status::NotReady) return Status::Busy;   // "still waiting", not a failure
+        if (isOk(st)) sink.publish(SensorMessage::fromMag(s));
+        return st;
+    }
+With a 20 ms period: trigger at t, collect at t+10, trigger at t+20 -> 50 Hz,
+and zero waiting inside any cycle (test audit_b_mag_source_is_non_blocking_two_phase).
+
+B.3 The init budget: at most one slow start-up per cycle
+--------------------------------------------------------
+Files: Components/Acquisition/AcquisitionSources.hpp (struct CycleBudget),
+       AcquisitionScheduler.hpp/.cpp (new), Tasks/TaskConfig.hpp
+
+    struct CycleBudget {
+        uint8_t initAttemptsRemaining = 1u;
+        uint32_t initAttemptsDeferred = 0u;
+    };
+A sensor's init() can wait (LSM6DSRX reset up to 50 ms, magnetometer power-on
+10 ms). The scheduler hands every source the same budget object each cycle;
+a source that wants to init either takes the slot or is "deferred" to a later
+cycle:
+    if (budget.initAttemptsRemaining == 0u) { ++budget.initAttemptsDeferred; return; }
+    --budget.initAttemptsRemaining;
+Passed by REFERENCE (CycleBudget&) so every source sees and updates the same
+object. Default 1 = TaskConfig::INIT_ATTEMPTS_PER_CYCLE.
+Result: three IMUs whose reset hangs cost one 50 ms cycle, not one 150 ms
+cycle (tests audit_b_simultaneous_init_failures_are_spread_across_cycles vs
+audit_b_without_budget_init_waits_stack_up).
+
+AcquisitionScheduler::runCycle(ISampleSink& sink) - the loop body, moved out
+of the task so it can be tested on a laptop:
+    const uint32_t start = clock_.millis();
+    CycleBudget budget{}; budget.initAttemptsRemaining = initAttemptsPerCycle_;
+    for (size_t k = 0; k < count_; ++k)
+        sources_[(rotation_ + k) % count_]->service(start, sink, budget);
+    rotation_ = (rotation_ + 1u) % count_;
+    const uint32_t elapsed = clock_.millis() - start;
+    ... cycles, lastCycleTimeMs, maxCycleTimeMs, cycleOverruns, initAttemptsDeferred
+The starting source rotates each cycle so ties for the init slot are shared
+fairly. "%" (remainder) wraps the index back to 0.
+
+Compatibility: IAcquisitionSource gained a 3-argument service(now, sink,
+budget); the old 2-argument call still works because the interface keeps a
+small wrapper:
+    void service(uint32_t nowMs, ISampleSink& sink) { CycleBudget b{}; service(nowMs, sink, b); }
+In C++ a derived class that defines one overload "hides" the others, so the
+derived classes add  using IAcquisitionSource::service;  to bring it back.
+
+B.4 Retry with exponential backoff
+----------------------------------
+PolledSourceBase::service(), init branch:
+    if (attempted_ && (nowMs - lastAttemptMs_) < retryMs_) return;   // still waiting
+    ...
+    if (attempted_) {
+        retryMs_ = (retryMs_ >= policy_.maxRetryMs / 2u) ? policy_.maxRetryMs : retryMs_ * 2u;
+    }
+First failure waits 1 s, then 2, 4, 8, 8, 8 s (RetryPolicy defaults). A
+missing sensor no longer costs its init delay every second forever, and the
+test shows a second failing barometer is not starved
+(audit_b_two_barometers_fail_together_retry_with_backoff: gaps 1000, 2000,
+4000, 8000, 8000 ms; zero overruns over 40 s of simulated time).
+The check "(retryMs_ >= max/2) ? max : retryMs_*2" doubles without ever
+overflowing or exceeding the cap.
+
+B.5 Re-initialise a sensor that stops working
+---------------------------------------------
+PolledSourceBase::account(Status s), called after every read:
+    if (isOk(s) || s == Status::OutOfRange || s == Status::Busy) { consecutiveReadFailures_ = 0u; return; }
+    ++consecutiveReadFailures_;
+    if (consecutiveReadFailures_ >= policy_.reinitAfterConsecutiveFailures) {   // 10
+        needsInit_ = true; attempted_ = false; retryMs_ = policy_.initialRetryMs;
+        ++reinitCount_;
+    }
+OutOfRange means "alive but measuring nonsense" (still published, flagged
+invalid), Busy means "magnetometer still converting" - neither counts.
+Previously the source asked the DRIVER whether it was initialised; a driver
+that had browned out still said "yes", so it was never restarted. Now the
+source keeps its own needsInit_ flag.
+Timeline at 100 Hz (test audit_b_dead_sensor_after_init_triggers_reinit_and_recovers):
+  t = 0 ms   sensor fails
+  t = 30 ms  health.isHealthy() becomes false (3 failures) - consumers can react
+  t = 100 ms 10 failures -> re-init attempt (then 1, 2, 4, 8 s backoff)
+  connector back -> next attempt succeeds, reinitCount = 1, data flows again.
+
+B.6 Missed deadlines without a catch-up burst
+---------------------------------------------
+File: Components/Tasks/SensorAcquisitionTask.cpp, Run()
+    if (xTaskDelayUntil(&lastWake, period) == pdFALSE) {
+        ++missedDeadlines_;
+        lastWake = xTaskGetTickCount();
+    }
+    scheduler_.runCycle(hub_);
+xTaskDelayUntil(&lastWake, 10) means "sleep until lastWake + 10, then set
+lastWake to that time". If that time is already in the past it does not
+sleep and returns pdFALSE. Without the added line, lastWake stays in the past
+and the NEXT calls also return immediately: the task runs several cycles
+back-to-back to "catch up", and each is counted as a miss. Re-anchoring to
+now makes one late cycle cost exactly one miss. (FreeRTOS behaviour verified
+by reading tasks.c; the RTOS loop itself can only be exercised on hardware.)
+
+B.7 Bigger UART receive buffer
+------------------------------
+Components/BSP/HalUartPort.hpp:  kRxBufferSize = 1024u  (was 512).
+At 115200 baud the LiDAR sends ~11.5 bytes per ms. 512 bytes last ~44 ms;
+a 50 ms start-up stall would overflow it. 1024 bytes last ~89 ms. Must stay a
+power of two (the ring buffer uses "index & (N-1)").
+
+
+===============================================================================
+C. GETTING FRESH DATA TO THE RIGHT CONSUMER
+===============================================================================
+
+C.1 The idea in plain words
+---------------------------
+When a consumer is slower than the sensors, something has to be thrown away.
+Which thing depends on the consumer:
+  - a LOGGER wants an unbroken, ordered record and to know what was lost
+    -> keep what is queued, drop the newest, count it (old behaviour);
+  - NAVIGATION wants the most recent samples, still in order
+    -> drop the OLDEST queued sample to make room, count it;
+  - a SAFETY check wants only "the latest value of each sensor, and how old
+    it is" -> a mailbox with one slot per sensor, always overwritten.
+Test audit_c_slow_consumer_sees_fresh_data_with_drop_oldest shows the
+difference: drop-newest served samples ~800 ms old, drop-oldest <= 70 ms.
+
+C.2 SensorDataHub::publish() (Components/Acquisition/SensorDataHub.cpp)
+-----------------------------------------------------------------------
+    for (size_t i = 0; i < count_; ++i) {
+        Subscription& s = subs_[i];
+        if (s.queue->tryPush(msg)) continue;                         // had room
+        if (s.policy == OverflowPolicy::DropOldest && s.queue->discardOldest()) {
+            saturatingIncrement(s.overwrites);
+            if (s.queue->tryPush(msg)) continue;
+        }
+        saturatingIncrement(s.drops);
+    }
+    for (size_t i = 0; i < mailboxCount_; ++i) mailboxes_[i]->store(msg);
+- Never blocks: tryPush/discardOldest use zero-wait queue operations.
+- "saturatingIncrement" stops at the maximum instead of wrapping to 0, so a
+  counter can never pretend nothing was lost.
+- subscribe(queue) without a policy keeps the old drop-newest behaviour.
+Why discardOldest() is safe on a FreeRTOS queue (RtosSampleQueue):
+    bool discardOldest() override {
+        SensorMessage dropped;
+        return handle_ != nullptr && xQueueReceive(handle_, &dropped, 0) == pdPASS;
+    }
+Each FreeRTOS queue call is atomic (it runs inside the kernel's own critical
+section). If the consumer receives at the same moment, the two simply get
+different messages. Only the producer ever ADDS messages, so after it removes
+one there is space for its own send. xQueueOverwrite() was not used: it is
+only defined for queues of length 1.
+
+C.3 LatestSampleMailbox (Components/Acquisition/LatestSampleMailbox.hpp)
+-----------------------------------------------------------------------
+    void store(const SensorMessage& msg) {
+        const SampleHeader* h = headerOf(msg);              // which sensor?
+        if (h == nullptr || static_cast<size_t>(h->id) >= kSlots) return;
+        Slot& slot = slots_[static_cast<size_t>(h->id)];
+        lock_.enter(); slot.msg = msg; slot.present = true; ++slot.writes; lock_.exit();
+    }
+    bool read(SensorId id, SensorMessage& out) const { ... lock_.enter(); copy; lock_.exit(); }
+- One slot per SensorId (8 x 88 bytes = 776 bytes, fixed).
+- Copying 88 bytes is not "atomic": a reader could otherwise see half old,
+  half new data (a "torn read"). The copy is therefore done inside a lock.
+- The lock is an INTERFACE (ICriticalSection) so the same code works:
+    on the STM32: RtosCriticalSection -> taskENTER_CRITICAL/taskEXIT_CRITICAL
+      (briefly raises BASEPRI; ~1 microsecond for 88 bytes);
+    in host tests: a std::mutex, so real threads can hammer it.
+  Test concurrency_mailbox_reads_are_never_torn: 50 000 writes from one
+  thread while another reads continuously; every read is self-consistent;
+  ThreadSanitizer reports no races.
+- headerOf() (SensorMessage.hpp) returns a pointer to the header of whichever
+  union member is active, or nullptr - so generic code can find the sensor
+  id, timestamp and sequence of any message.
+- SensorAcquisitionTask owns one mailbox (latest()), subscribed in its
+  constructor; HealthMonitorTask uses it to report the age of every sensor's
+  newest sample (g_systemHealth.latestSampleAgeMs[]).
+
+C.4 Freshness and sequence gaps (Components/Acquisition/SampleFreshness.hpp)
+---------------------------------------------------------------------------
+    constexpr uint32_t sampleAgeMs(const SampleHeader& h, uint32_t nowMs) { return nowMs - h.timestampMs; }
+    constexpr bool isFresh(const SampleHeader& h, uint32_t nowMs, uint32_t maxAgeMs)
+        { return h.valid && sampleAgeMs(h, nowMs) <= maxAgeMs; }
+Unsigned subtraction is wrap-safe: 0x00000010 - 0xFFFFFFF0 = 0x20 = 32 ms
+(test audit_c_freshness_across_counter_wrap).
+SequenceTracker::observe(msg) remembers the last sequence number per sensor
+for ONE consumer and returns how many were skipped:
+    expected = last + 1
+    seq == expected          -> gap 0
+    seq  > expected (signed) -> gap = seq - expected, lost += gap
+    otherwise                -> duplicate/out of order (counted, ignored)
+This makes loss visible to the consumer itself, whatever caused it.
+
+
+===============================================================================
+D. CATCHING STACK OVERFLOWS AND OUT-OF-MEMORY
+===============================================================================
+
+D.1 The idea in plain words
+---------------------------
+Each task has a fixed-size stack. If it uses more, it silently overwrites
+other memory and the device misbehaves in random ways. FreeRTOS can check for
+this at every task switch, and can tell us when its memory allocator runs
+out - but both checks were switched off.
+
+D.2 How they were switched on without guessing
+-----------------------------------------------
+The .ioc file is CubeMX's database; a wrong key name would be ignored or
+cause problems later. Instead of guessing, a COPY of the project was given
+the candidate keys and regenerated with STM32CubeMX 6.18.1 from the command
+line. CubeMX accepted them and produced:
+  Inc/FreeRTOSConfig.h:   #define configCHECK_FOR_STACK_OVERFLOW 2
+                          #define configUSE_MALLOC_FAILED_HOOK   1
+  Src/freertos.c:         vApplicationStackOverflowHook() and
+                          vApplicationMallocFailedHook(), each INSIDE a
+                          USER CODE block (so our additions survive).
+Exactly those three CubeMX-generated files were copied into the project.
+Level 2 checking = at each context switch, check the stack pointer AND that
+the last 20 bytes of the stack still hold the 0xA5 fill pattern
+(FreeRTOS stack_macros.h, ucExpectedStackBytes).
+
+D.3 Src/freertos.c (inside USER CODE)
+-------------------------------------
+    #include "../Components/SysCore/FaultHooks.h"            // USER CODE Includes
+    void vApplicationStackOverflowHook(xTaskHandle xTask, char *pcTaskName) {
+       ...
+       paraguardian_on_stack_overflow(xTask, pcTaskName);
+    }
+    void vApplicationMallocFailedHook(void) {
+       ...
+       paraguardian_on_malloc_failed();
+    }
+ParaGuardian does NOT define the hooks itself, so there is exactly one
+definition of each (checked in the linked image).
+
+D.4 Components/SysCore/FaultHooks.cpp
+-------------------------------------
+paraguardian_on_stack_overflow(TaskHandle_t task, const char* taskName)
+  Runs inside the kernel's task switch (interrupt context). Rules: no
+  waiting, no heap, no printing.
+    taskDISABLE_INTERRUPTS();
+    ++h.stackOverflowCount;
+    for (; i + 1u < sizeof(h.lastStackOverflowTask) && taskName[i] != '\0'; ++i)
+        h.lastStackOverflowTask[i] = taskName[i];          // bounded copy (max 15 chars + NUL)
+    h.lastStackOverflowTask[i] = '\0';
+    if ((CoreDebug->DHCSR & CoreDebug_DHCSR_C_DEBUGEN_Msk) != 0u) __BKPT(0);
+    NVIC_SystemReset();
+  - The bounded loop cannot overrun the 16-byte array even with a corrupted name.
+  - BKPT (breakpoint instruction) halts in the debugger so you can read
+    g_systemHealth. Without a debugger BKPT would cause a HardFault, so it is
+    only executed when the debug-enable bit says a debugger is attached.
+  - Then reset: the overflow may have corrupted memory, so continuing is
+    unsafe. The device does not depend on a debugger to recover.
+paraguardian_on_malloc_failed(): ++mallocFailedCount; returns. The function
+  that asked for memory still receives NULL and must handle it.
+paraguardian_capture_reset_cause(): called once in paraguardian_create_tasks()
+    pg::g_systemHealth.resetFlags = RCC->RSR;   // why did we reset?
+    __HAL_RCC_CLEAR_RESET_FLAGS();              // so the next boot reports its own cause
+  RCC->RSR survives a reset in hardware: bit 24 software reset (overflow hook,
+  SOAR_ASSERT), 26 independent watchdog, 21 brown-out, 22 reset pin,
+  23 power-on. The task NAME does not survive (RAM is cleared at boot);
+  keeping it would need RTC backup registers or a flash log (later).
+  A ".noinit" RAM section was rejected: the STM32H7's RAM error-correction
+  (ECC) can flag reads of RAM that was never written since power-up.
+
+
+===============================================================================
+E. CMSIS-V2 / SOAROS RE-CHECK
+===============================================================================
+Nothing needed changing:
+- one osKernelInitialize(), one osKernelStart() (generated code only);
+- stack depths in words for our tasks, bytes only in CubeMX's osThreadAttr_t;
+- priorities by osPriority_t name, all below configMAX_PRIORITIES (56);
+- defaultTask ends with osThreadExit(), the V2 call matching osThreadNew();
+- native TaskHandle_t everywhere in our code.
+The timer service task runs at priority 2, below our tasks. That is fine
+today because nothing uses software timers. If SoarOS Timer objects are used
+later, raise TIMER_TASK_PRIORITY in CubeMX above the tasks that depend on
+their callbacks.
+
+
+===============================================================================
+F. CUBEMX REGENERATION CHECKLIST
+===============================================================================
+Tested: STM32CubeMX 6.18.1 command-line regeneration of a copy changed only
+the ORDER of two source entries in .cproject; every setting below survived.
+Still, after every "Generate Code", check:
+ [ ] .project contains org.eclipse.cdt.core.ccnature
+ [ ] Project > Properties > C/C++ Build > Settings > MCU/MPU G++ Compiler:
+       Language standard GNU++17; Include paths include ../Components,
+       ../SoarOS, ../SoarOS/Core/Inc, ../SoarOS/Drivers/Inc,
+       ../SoarOS/Libraries/embedded-template-library/include;
+       Include files (-include): ../Components/SysCore/SoarOSCmsisV2Compat.h;
+       Defines USE_PWR_LDO_SUPPLY, USE_HAL_DRIVER, STM32H743xx (+DEBUG in Debug)
+ [ ] MCU/MPU G++ Linker: linker script STM32H743ZITX_FLASH.ld
+ [ ] Source folders Components and SoarOS present; SoarOS excludes Profiler,
+       Libraries, Drivers/UARTDriver.cpp, Drivers/UARTTask.cpp, Core/CubeUtils.cpp
+ [ ] Src/main.c USER CODE: RunInterface.h include, paraguardian_create_tasks()
+       in RTOS_THREADS, paraguardian_default_task() in USER CODE 5
+ [ ] Src/freertos.c USER CODE: FaultHooks.h include and the two forwarder calls
+ [ ] FreeRTOSConfig.h still has configCHECK_FOR_STACK_OVERFLOW 2 and
+       configUSE_MALLOC_FAILED_HOOK 1
+ [ ] The time base is still TIM6 (HalTickFallback.cpp uses htim6)
+ [ ] Build Debug and Release; run sh Tests/run_host_tests.sh
+If CubeMX ever asks to MIGRATE the project to a newer version, do it on a
+copy first and diff the files (the migration path was not tested).
+
+
+===============================================================================
+G. HOW THE TESTS WERE BUILT
+===============================================================================
+- 22 new tests in Tests/unit/test_hardening.cpp; 120 total, all passing.
+- Timing tests share one MockClock between the drivers and the scheduler.
+  The fake clock only moves when code calls delayMs(), so "cycle time" in a
+  test = time the code chose to WAIT - exactly the part that can break a
+  deadline. (Bus transfer time is estimated separately in
+  RTOS_TIMING_ANALYSIS.md.)
+- The magnetometer fake finishes a conversion 8 ms after it was started
+  (time-based, like the chip). An earlier poll-count-based fake was wrong and
+  was fixed - a reminder that fakes must model the real device's behaviour.
+- Concurrency tests use real std::thread; running
+      SANITIZE=thread sh Tests/run_host_tests.sh
+  turns on ThreadSanitizer, which reports unsynchronised memory access.
+  Result: 0 warnings.
+
+
+===============================================================================
+H. WHAT STILL NEEDS HARDWARE
+===============================================================================
+- Measure real cycle times (expected <= ~1.5 ms with SPI sensors).
+- Confirm tickFallbackIncrements > 0 after boot (proves Audit A on silicon).
+- Provoke a stack overflow with a test task; confirm reset and resetFlags bit 24.
+- Unplug/replug each sensor; check 30 ms detection and recovery.
+- Run GNSS + LiDAR at full rate through a forced stall; rxOverflows must stay 0.
+- Watch stack high-water marks and minimumEverFreeHeapBytes for 10+ minutes.
+
+===============================================================================
+END
+===============================================================================

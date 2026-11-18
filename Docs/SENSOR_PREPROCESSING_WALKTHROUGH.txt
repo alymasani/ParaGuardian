@@ -1,0 +1,1273 @@
+===============================================================================
+ PARAGUARDIAN - SENSOR PREPROCESSING, CALIBRATION AND REDUNDANCY
+ A plain-English walkthrough of the actual implementation (Milestone 2)
+===============================================================================
+
+Date: 2026-11-17
+Written for: an engineering student studying the code before a design review
+(it is also meant to be pasted, section by section, into a chat assistant
+for further questions).
+
+HONESTY NOTES - read these first
+  * Nothing described here has run on ParaGuardian hardware. There is no PCB
+    and there are no sensors yet. "Tested" below always means: tested on a
+    laptop with simulated data, or compiled in STM32CubeIDE.
+  * Every threshold is an engineering starting point with a written reason.
+    None is a tuned value.
+  * The sensor-to-body mounting matrices are identity PLACEHOLDERS, because
+    the board orientation is unknown.
+  * This code, the tests and this document were produced with AI assistance
+    (Claude Code, Anthropic), working from your project brief and the
+    existing code. Credit it as such under your university's policy.
+  * Line numbers refer to the files as delivered. They will drift as soon as
+    you edit the files.
+
+How to run what is described here
+  Host tests (laptop):   sh Tests/run_host_tests.sh                (ASan+UBSan)
+                         SANITIZE=thread sh Tests/run_host_tests.sh (TSan)
+  Firmware:              open the project in STM32CubeIDE and build Debug/Release.
+
+TABLE OF CONTENTS
+  A. How preprocessing fits into ParaGuardian
+  B. Sensor validity and freshness
+  C. Timestamp synchronization
+  D. Stationary detection
+  E. Gyroscope calibration (and why the accelerometer is NOT calibrated)
+  F. Coordinate alignment
+  G. Barometric reference calibration
+  H. Redundant sensor validation
+  I. ProcessedSensorFrame
+  J. FreeRTOS task integration
+  K. Simulation and testing
+  L. Future integration with Madgwick and UKF
+  Appendix 1. Every file in one table
+  Appendix 2. What remains unverified until hardware exists
+  Appendix 3. Questions a reviewer is likely to ask (with answers)
+
+
+===============================================================================
+A. HOW PREPROCESSING FITS INTO PARAGUARDIAN
+===============================================================================
+
+A.1 Before this milestone
+-------------------------
+Milestone 1 and the reliability hardening built this chain:
+
+  sensor chip --SPI/I2C/UART--> driver (e.g. Lsm6dsrx)
+              --> AcquisitionSource (ImuSource, BaroSource, ...)
+              --> AcquisitionScheduler (inside SensorAcquisitionTask, every 10 ms)
+              --> SensorDataHub::publish(SensorMessage)
+              --> subscribers (queues and mailboxes)
+
+At that point every sample was:
+  * in SI units (m/s^2, rad/s, Pa, uT, m),
+  * in the CHIP's own axes (whatever way the chip is soldered),
+  * stamped with the MCU time at which the read finished, plus a sequence
+    number,
+  * marked valid/invalid by the driver.
+
+Nothing consumed those samples yet. No calibration existed, nothing compared
+the three IMUs, and no barometric altitude was computed.
+
+A.2 What this milestone adds
+----------------------------
+A middle layer between "raw SI samples" and the future algorithms
+(Madgwick, UKF, safety logic):
+
+  raw SensorMessage
+    -> 1 validity and timestamp checks       (SampleValidator)
+    -> 2 calibration                         (CalibrationController: StationaryDetector,
+                                              GyroBiasCalibrator, BaroReferenceCalibrator)
+    -> 3 correction and alignment            (gyro - bias; AxisAlignment sensor -> body)
+    -> 4 redundant sensor comparison         (RedundancyVoter)
+    -> ProcessedSensorFrame                  (one struct with values AND quality metadata)
+
+A.3 Where the code lives, and why it is split into two layers
+--------------------------------------------------------------
+  Components/Processing/   PORTABLE C++17. No HAL, no FreeRTOS, no heap.
+                           The same .cpp files compile into the firmware AND
+                           into the laptop test program.
+  Components/Tasks/SensorProcessingTask.*
+                           The ONLY new file that knows about FreeRTOS. It
+                           takes messages from a queue, calls the portable
+                           pipeline, and publishes frames.
+
+Why this split: about 95 % of the logic can then be tested in milliseconds
+on a laptop with sanitizers, deterministic simulated data and exact expected
+values. On the target you could only test it slowly, by hand, once hardware
+exists. The pattern is the same as the drivers (portable, with injected bus
+interfaces) and the acquisition scheduler.
+
+A.4 Main design rules followed everywhere
+-----------------------------------------
+  1. Missing data is NEVER zero. Every value has a valid flag. A frame can
+     say "no angular rate this time", and that is better than reporting 0
+     rad/s.
+  2. Every sensor keeps its own timestamp. Nothing is shifted, interpolated
+     or invented.
+  3. No dynamic memory. Every object has a fixed size known at compile time.
+     The pipeline is a member of the task object, which is a static
+     singleton.
+  4. Every loop has a compile-time bound (3 IMUs, 2 barometers, 8 segments,
+     23 reason bits, queue depth 64).
+  5. The acquisition task is never slowed down. Its only extra cost is
+     copying 88 bytes into one more queue per message.
+  6. Reuse existing types: Vec3f, SensorId, SampleHeader, ImuSample,
+     SensorMessage, SensorDataHub, RtosSampleQueue, ICriticalSection and
+     SequenceTracker (extended, not replaced).
+
+
+===============================================================================
+B. SENSOR VALIDITY AND FRESHNESS
+===============================================================================
+
+Files: Components/Processing/SampleValidator.hpp / .cpp
+       Components/Processing/ProcessingTypes.hpp       (reject:: reason bits)
+       Components/Processing/ProcessingConfig.hpp      (ValidationConfig)
+       Components/Acquisition/SampleFreshness.hpp      (SequenceTracker, extended)
+
+B.1 Purpose
+-----------
+Decide, for ONE incoming sample, whether it may be used, and if not, record
+exactly why. The validator does not compare sensors with each other. It
+checks each sample on its own merits and against that same sensor's history
+(sequence numbers and timestamps).
+
+B.2 Inputs and outputs
+----------------------
+  Input : const SensorMessage& msg   - the tagged union published by acquisition
+          uint32_t nowMs              - current MCU time (processing task)
+  Output: ValidationResult (SampleValidator.hpp):
+            reasons      bit mask of reject:: values (0 = nothing wrong)
+            ageMs        nowMs - timestampMs (0 if the timestamp is in the future)
+            sequenceGap  how many samples of this sensor were never received
+            sequence     First / InOrder / Gap / Duplicate / OutOfOrder / Invalid
+            accepted     no "whole-sample" reason is set
+            accelUsable  IMU only: accepted AND no accelerometer-channel reason
+            gyroUsable   IMU only: accepted AND no gyro-channel reason
+
+Why a bit mask instead of one boolean (the brief asked for this
+explicitly): one sample can be wrong in several ways at once, for example
+stale AND saturated. A boolean would hide which. With bits, the debugger
+shows e.g. reasons = 0x0810, which decodes to Stale (bit 4) plus
+GyroSaturated (bit 11).
+
+Why separate accelUsable/gyroUsable: the LSM6DSRX accelerometer and gyro
+saturate independently. During a fast spin the gyro may hit +-2000 dps while
+the accelerometer is perfectly fine. Rejecting the whole sample would throw
+away good data.
+
+B.3 The checks, step by step (SampleValidator.cpp)
+--------------------------------------------------
+contentReasons() - line 47 - looks only at the sample's contents:
+  * No sample at all (type None)                         -> NoSample
+  * id does not match the message type (an IMU payload
+    claiming to be Baro0), via idMatchesType() line 34    -> UnknownSensor
+  * driver said header.valid = false                     -> FlagInvalid
+  * IMU:  NaN/Inf in accel, gyro or temperature          -> NonFinite
+          (the range checks are skipped then: comparing NaN is meaningless)
+          accelSaturated / gyroSaturated from the driver -> Accel/GyroSaturated
+          any component above the configured full scale  -> Accel/GyroOutOfRange
+          status register said "no new data"             -> Accel/GyroNotNew
+          die temperature outside -40..105 C              -> TemperatureRange
+  * Barometer: NaN, pressure <= 0 or outside 300..1250 hPa,
+          temperature outside -40..85 C
+  * Magnetometer: NaN, saturated, |component| > 800 uT
+  * GNSS: NaN in a used float, no valid fix, negative accuracy estimate
+  * LiDAR: NaN, out of range or negative, weak signal
+
+validate() - line 134 - adds the time and sequence checks:
+  line 152  ahead = diffMs(timestamp, now). A timestamp more than maxFutureMs
+            (2 ms) AHEAD of "now" is impossible -> TimestampFuture.
+            (1-2 ms ahead is tolerated: HAL_GetTick() has 1 ms steps and the
+            two reads can straddle a tick.)
+  line 156  ageMs = ageMs(timestamp, now). If age > maxAgeMs[sensor] -> Stale.
+  line 165  SequenceTracker classification: Duplicate (the same sequence
+            number again) or OutOfOrder (older than one already seen).
+  line 169  "newer sequence number but OLDER timestamp than the last accepted
+            sample" -> TimestampBackwards. Time must not run backwards for a
+            sensor; if it does, the clock or the driver is inconsistent.
+  line 175  accepted = no whole-sample reason set.
+  line 181  an IMU sample with NEITHER channel usable is rejected as a whole.
+
+record() keeps per-sensor accepted/rejected counts, the last reason mask,
+and one counter per reason bit (all saturating: they stop at UINT32_MAX
+rather than wrapping to 0).
+
+B.4 The deliberate NON-check: free fall
+---------------------------------------
+There is no minimum on |acceleration|. An accelerometer measures SPECIFIC
+FORCE (acceleration minus gravity). In free fall it reads about 0, and in a
+paragliding collapse or a fall that is exactly what you want to detect
+later, not throw away. A dead IMU is detected in other ways: the driver
+flags errors, it stops producing data (freshness), or it disagrees with the
+other IMUs (redundancy). Test: prep_validation_free_fall_is_not_a_fault.
+
+B.5 Freshness thresholds (per sensor, ValidationConfig::maxAgeMs)
+-----------------------------------------------------------------
+  IMU 30 ms   (period 10 ms x 3)       Baro 60 ms (period 20 ms x 3)
+  Mag 60 ms   (period 20 ms x 3)       GNSS 2000 ms (= the NeoM9n driver's stale timeout)
+  LiDAR 50 ms (frames about every 10 ms; the driver's own stale limit is 100 ms)
+Reason for "about 3 periods": allow one missed acquisition cycle plus tick
+jitter and queue latency, and still reject anything older. One global
+threshold would be wrong. 30 ms is far too short for GNSS, and 2 s is far
+too long for an IMU.
+
+The limits are applied TWICE:
+  * at ingest, by the validator (a sample that waited too long in the queue);
+  * at frame time, by PreprocessingPipeline::fresh() (line 75): the newest
+    stored sample of a sensor that has since gone silent becomes "not
+    fresh" and stops contributing.
+
+B.6 Sequence tracking (SampleFreshness.hpp, extended)
+-----------------------------------------------------
+Every driver increments header.sequence once per sample it produces, and it
+does not reset on re-init. I checked this in Lsm6dsrx.cpp:223,
+Bmp585.cpp:186 and Mmc5983ma.cpp:189. So for one sensor:
+  expected = last + 1
+  sequence == expected            -> InOrder
+  sequence  > expected (signed)   -> Gap: (sequence - expected) samples were lost
+  sequence == last                -> Duplicate
+  sequence  < last                -> OutOfOrder
+observeHeader() (line 80) returns this classification. The older observe()
+keeps its exact original behaviour (it returns only the gap), so the 120
+existing tests and HealthMonitor are unaffected. The comparison uses
+int32 differences, so it also survives the sequence counter wrapping.
+
+Numerical example (prep_validation_duplicates_out_of_order_and_gaps):
+  seq 10 at t=100 -> First, accepted
+  seq 10 again    -> Duplicate, rejected
+  seq 14 at t=140 -> Gap = 3 (11, 12 and 13 never arrived), accepted
+  seq 12 at t=120 -> OutOfOrder, rejected;  lostCount(Imu0) = 3
+
+B.7 Memory, timing, errors, tests
+---------------------------------
+  Memory: SampleValidator = 548 B (8 sensors x 24 B state + 23 counters +
+          the SequenceTracker). It is a member of the pipeline; lifetime = forever.
+  Timing: O(1); a few dozen comparisons and up to 7 isfinite() calls.
+  Errors: never throws, never asserts. It reports through the result.
+  Tests : 15 in Tests/unit/test_preprocessing_validation.cpp (invalid
+          flags, NaN/Inf, saturation per channel, range, not-new, free
+          fall, per-sensor staleness, future/backwards timestamps,
+          duplicates, gaps, out-of-order, id mismatch, wraparound).
+
+
+===============================================================================
+C. TIMESTAMP SYNCHRONIZATION
+===============================================================================
+
+File: Components/Processing/TimeBase.hpp
+
+C.1 The convention (what a timestamp MEANS)
+-------------------------------------------
+SampleHeader::timestampMs = HAL_GetTick() milliseconds at the moment the
+driver FINISHED reading the sample. That is NOT the physical instant the
+quantity was measured:
+  * an IMU's digital filter delays the signal,
+  * a BMP585 conversion takes a few ms,
+  * a GNSS solution refers to an epoch that may be 10s of ms earlier.
+These latencies are not known for this hardware. The code therefore states
+the convention and provides a hook to correct it later
+(IMeasurementTimeModel, FixedLatencyTimeModel, with all latencies set to 0).
+
+C.2 Two samples in the same cycle are NOT simultaneous
+------------------------------------------------------
+The three IMUs are read one after another within a cycle (and the scheduler
+rotates the order), so their timestamps can differ by a millisecond or two.
+Barometers at 50 Hz may even be read in different 10 ms cycles. The code
+never assumes equality. The redundancy voter compares two samples only if
+their timestamps are within maxSkewMs (IMU 15 ms, barometer 30 ms). Its
+output carries BOTH the newest contributing timestamp and the spread
+(newest - oldest), so a consumer knows how "smeared" a fused value is.
+
+C.3 Wraparound
+--------------
+A uint32 millisecond counter wraps after 2^32 ms = 49.7 days. The trick:
+
+  diffMs(later, earlier) = (int32_t)(later - earlier)
+
+Unsigned subtraction wraps modulo 2^32, and interpreting the result as
+signed gives the correct signed interval whenever the true interval is
+below 2^31 ms (24.8 days).
+Example: earlier = 0xFFFFFFF0 (16 ms before the wrap), later = 0x00000010
+(16 ms after it). later - earlier = 0x00000020 = 32, which is correct. The
+reverse gives -32.
+ageMs() returns 0 for a timestamp in the future instead of a huge unsigned
+number. That matters: without it, a future timestamp would look about 49
+days old.
+Every interval compared in preprocessing is seconds at most, so the 24.8-day
+limit is never approached.
+Tests: prep_time_wraparound_diff_and_age, prep_time_validator_across_wrap,
+and prep_e2e_runs_across_timestamp_wraparound. The last one runs a complete
+calibration that crosses the wrap 3 s in, and checks that nothing is
+rejected and dt stays 10 ms.
+
+C.4 Per-sensor latest valid measurement and its age
+---------------------------------------------------
+PreprocessingPipeline keeps one small "state" struct per sensor (ImuState,
+BaroState, MagState, GnssState, LidarState). Each holds the newest ACCEPTED
+sample (already corrected and aligned) together with ITS OWN timestamp. When
+a frame is built, every channel reports:
+  timestampMs  (its own),
+  ageMs        (frame time - timestampMs),
+  fresh        (ageMs <= that sensor's limit).
+Nothing is copied forward as if it were new: an old value stays labelled
+with its old time.
+
+C.5 Out-of-order arrival
+------------------------
+Per sensor: rejected (OutOfOrder / TimestampBackwards). Across sensors,
+arrival order does not matter, because each sensor has its own slot. With
+one FIFO queue and one producer, per-sensor reordering should never happen
+on the real system. The checks protect against driver bugs and future
+multi-producer designs.
+
+C.6 GNSS time vs MCU time
+-------------------------
+A GNSS sample carries two times:
+  gnssTimeOfWeek_ms   receiver clock (GPS time of week)
+  header.timestampMs  MCU clock when the UBX message was parsed
+They are different clocks with an unknown offset and drift. The frame passes
+both through (gnss.timeOfWeek_ms, gnss.timestampMs) and never converts one
+into the other. ProcessedSensorFrame::timeDomain documents that every
+*timestampMs field is MCU time. A real mapping needs the receiver's
+TIMEPULSE signal on a timer-capture pin, which is a hardware decision (see
+HARDWARE_INTEGRATION_TODO.md section 12).
+
+C.7 No interpolation - why
+--------------------------
+Interpolating between two IMU samples to "align" them assumes the signal is
+smooth between samples, and it adds half a period of latency. Neither has
+been justified for this hardware. Both are easy to add later behind
+IMeasurementTimeModel, with their own tests. The brief forbade adding them
+without documented assumptions and tests.
+
+C.8 Timestamp jitter
+--------------------
+prep_e2e_timestamp_jitter_tolerated_and_dt_follows_samples makes every IMU
+timestamp randomly 0-4 ms early. The result: nothing is rejected, every
+frame is Healthy, and gyroDtMs varies between 6 and 14 ms, following the
+real timestamps. The time step a Madgwick filter will use is MEASURED, not
+assumed to be 10 ms.
+
+
+===============================================================================
+D. STATIONARY DETECTION
+===============================================================================
+
+Files: Components/Processing/StationaryDetector.hpp / .cpp
+       Components/Processing/RunningStats.hpp   (streaming statistics)
+       ProcessingConfig.hpp: StationaryConfig
+
+D.1 Purpose
+-----------
+Answer "has THIS IMU been continuously still for a whole observation
+window?" Gyro-bias calibration is only valid if the true rotation rate is
+zero, and the barometer reference is only meaningful if the device is not
+being carried up or down. One detector exists per IMU.
+
+D.2 Input, output, status values
+--------------------------------
+  add(timestampMs, gyro_radps, accel_mps2) -> StationaryStatus
+    InsufficientData  window not yet long enough, or too few samples
+    Moving            this sample, or the window statistics, showed motion
+    Stationary        a full, continuous, quiet window was observed
+  report() gives the evidence: samples, elapsed time, means, standard
+  deviations, segment spreads, the cause of the last restart, and restart
+  counters.
+Only samples the validator accepted with BOTH channels usable are fed in, in
+SENSOR axes. Stillness does not depend on how the chip is mounted.
+
+D.3 The tests a window must pass (StationaryDetector.cpp)
+---------------------------------------------------------
+1) INSTANTANEOUS, on every sample (line 118 / line 122):
+     |w| <= 0.10 rad/s           and        | |a| - 9.80665 | <= 0.6 m/s^2
+   In words: no obvious rotation, and the accelerometer senses roughly
+   gravity only. The gyro limit is deliberately LOOSE because the gyro is
+   not calibrated yet. Its bias (typically of the order of 1 dps = 0.017
+   rad/s for MEMS gyros; confirm with the LSM6DSRX datasheet) must not
+   trigger "motion".
+   Any violation calls motion(): status Moving, the window restarts at the
+   next sample.
+
+2) NO GAPS: if two consecutive samples are more than 50 ms apart, the window
+   restarts (cause DataGap). We cannot vouch for a period we did not observe.
+
+3) LONG ENOUGH (line 151): elapsed = last - first >= 5000 ms AND samples >=
+   minSamples(). minSamples = (5000 / 10) x 0.8 = 400. The brief warned that
+   5 s at 100 Hz is "about 500 samples, but missing data must be accounted
+   for". This allows 20 % loss. With MORE loss, the window simply stretches
+   until 400 samples have been seen (prep_stationary_intermittent_missing_data:
+   every 4th sample missing -> Stationary only after 5 s).
+
+4) QUIET STATISTICS, once the window is long enough
+   (windowStatisticsQuiet(), line 50):
+     per-axis gyro standard deviation   <= 0.01 rad/s
+     standard deviation of |a|          <= 0.05 m/s^2
+     spread of 1-second segment means:  gyro per axis <= 0.005 rad/s
+                                        accel PER AXIS <= 0.05 m/s^2
+   A constant bias does not raise a standard deviation, but motion does.
+   That is why the gyro test is on the SPREAD, not on the mean.
+
+D.4 Why the per-axis accelerometer drift test exists (a defect found during this milestone)
+------------------------------------------------------------------------------------------
+Imagine the wearer turning slowly at a constant 0.05 rad/s (2.9 deg/s):
+  * every gyro sample reads 0.05: below the 0.10 limit;
+  * the gyro standard deviation is about 0: it looks EXACTLY like a bias;
+  * |a| stays exactly g, because rotating does not change gravity's size.
+The first version of the detector accepted this as "still". The gyro
+calibrator would then have stored the rotation as a 2.9 dps "bias", and
+every later angular rate would have been wrong by that amount.
+What does change is gravity's DIRECTION in the chip's axes. After 5 s at
+0.05 rad/s the accelerometer y-component moves by 9.81 x sin(0.25) = about
+2.4 m/s^2. Even at 0.005 rad/s it moves by 0.245 m/s^2. The five 1-second
+segment means are then 0.025, 0.074, 0.123, 0.172, 0.221, a spread of 0.196
+m/s^2, against a limit of 0.05. The window is rejected with cause
+AccelDrift. Test: prep_stationary_slow_constant_rotation_not_mistaken_for_bias,
+for both rates.
+
+D.5 Why no 500-sample history buffer
+------------------------------------
+All the tests above need only:
+  * a running mean and variance (Welford, below): 3 numbers per quantity;
+  * the sum and count of each 1-second segment: 8 slots per axis.
+So the detector costs about 0.7 KB instead of 500 x 24 B = 12 KB of raw
+samples per IMU.
+
+D.6 Welford's algorithm (RunningStats.hpp, lines 49-54)
+-------------------------------------------------------
+For every new value x:
+  n    = n + 1
+  d    = x - mean
+  mean = mean + d / n                 (line 52)
+  M2   = M2 + d * (x - mean)          (line 53; the NEW mean)
+  sample variance = M2 / (n - 1)
+Worked example: the values 0.010, 0.012, 0.008
+  n=1: d=0.010  mean=0.010  M2=0
+  n=2: d=0.002  mean=0.011  M2 = 0 + 0.002 x 0.001 = 0.000002
+  n=3: d=-0.003 mean=0.010  M2 = 0.000002 + (-0.003) x (-0.002) = 0.000008
+  variance = 0.000008 / 2 = 0.000004   -> std = 0.002
+  (Check: the deviations from 0.010 are 0, +0.002 and -0.002; their squares
+  sum to 8e-6, and 8e-6 / 2 = 4e-6. It matches.)
+Why not "mean of squares minus square of mean"? For a barometer, x is about
+101325 and the spread is about 1. Squaring gives about 1.03e10, and float
+has only about 7 significant digits, so the difference would be pure
+rounding noise. Welford works with deviations only. The accumulators are
+double. The STM32H743 FPU (fpv5-d16, confirmed in .cproject) does double
+precision in hardware.
+
+D.7 Memory, timing, errors, tests
+---------------------------------
+  Memory: about 0.7 KB per detector, 3 detectors, inside CalibrationController.
+  Timing: O(1) per sample: 2 norms (sqrt), 4 Welford updates and 6
+          segment adds. Once the window is long enough, the statistics are
+          re-evaluated per sample (6 spreads over 8 slots each).
+  Errors: non-finite input is ignored. A sample not newer than the previous
+          one is ignored.
+  Tests : 9 prep_stationary_* tests: perfectly still; realistic noise with
+          uncalibrated bias; constant rotation; slow constant rotation (two
+          rates); translational push (both a gentle 1.5 m/s^2, caught by
+          the window statistics, and a 3 m/s^2 shove, caught instantly);
+          short spike (needs a whole new 5 s); missing data and gaps; slow
+          drift accepted vs fast drift rejected; noisy (body sway) window.
+
+
+===============================================================================
+E. GYROSCOPE CALIBRATION
+===============================================================================
+
+Files: Components/Processing/Calibration.hpp / .cpp (GyroBiasCalibrator, AccelCalibration)
+       Components/Processing/CalibrationController.hpp / .cpp (the session)
+
+E.1 The physics in one paragraph
+--------------------------------
+A MEMS gyro reading is  w_measured = w_true + b + noise. When the device is
+still, w_true = 0. Earth's rotation is 7.3e-5 rad/s, below the noise, and is
+ignored. So the AVERAGE reading over a still window IS the bias b:
+  b_hat = mean(w_measured)              calibrated w = w_measured - b_hat
+The more samples, the better the estimate. The uncertainty of a mean is the
+noise divided by sqrt(n) (the "standard error"):
+  sigma_b = sigma / sqrt(n)
+Example: sigma = 0.0015 rad/s, n = 500 -> sigma_b = 6.7e-5 rad/s = 0.004 dps.
+
+E.2 GyroBiasCalibrator (Calibration.cpp)
+----------------------------------------
+  begin()     starts collecting. The ACTIVE (previous) calibration stays in
+              use meanwhile.
+  restart()   throws away the samples collected so far (after motion).
+  add(gyro)   Welford update per axis (RunningStats3).
+  finish(now, sessionId), line 29, evaluates the candidate:
+     n < 400 samples                       -> fail InsufficientSamples
+     mean or std not finite                -> fail InvalidValue
+     max per-axis std > 0.01 rad/s         -> fail TooNoisy
+     |mean| on any axis > 10 dps           -> fail InvalidValue (that is
+                                              motion or a broken chip, not a bias)
+     otherwise (lines 58-61) store: bias = mean, noiseStd = std,
+     biasStdError = std / sqrt(n), samples, timestamp, sessionId, valid = true.
+  correct(w)  returns w - bias if valid, otherwise w unchanged. (The pipeline
+              then marks the gyro as uncalibrated, see I.)
+  state()     Collecting / Valid / Failed / NotCalibrated.
+
+FAILURE POLICY: if a later calibration fails, the PREVIOUS valid bias is
+KEPT, and lastFailure() records why. Reason: a bias is a property of the
+chip. Last session's estimate is still a better correction than none.
+(Barometers do the opposite, see G.4. The two are different on purpose.)
+
+E.3 The session: CalibrationController (one state machine for all sensors)
+-------------------------------------------------------------------------
+  request(now) (line 24): sessionId++, state Collecting; every detector
+      reset, every gyro calibrator begin(), every barometer calibrator begin(now).
+  onImu(i, t, gyro, accel) (line 57): called by the pipeline for every
+      accepted IMU sample with both channels usable, in RAW sensor axes.
+        - the detector for IMU i gets the sample;
+        - line 64: if it says Moving -> restartAll(): EVERY detector, gyro
+          accumulator and barometer accumulator restarts. The device is one
+          rigid body: if one IMU moved, everything moved;
+        - line 71: if the detector just (re)started its own window (its
+          first sample, or after a data gap), the gyro accumulator is reset
+          too, so the two always cover the same samples;
+        - otherwise the gyro calibrator gets the sample.
+  onBaro(j, t, p) (line 77): barometer samples older than the current window
+      start (line 83) are ignored. They belong to a period with motion.
+  poll(now) (line 89): called after every message.
+        - session older than 60 s (line 94) -> failSession(TimedOut), or
+          NoStationaryImu if no IMU sample was ever seen;
+        - complete when at least ONE detector is Stationary AND (every IMU
+          seen in this session is Stationary OR the window is older than
+          5 s + 1 s grace) (line 114). The grace stops a missing or
+          intermittent IMU from blocking the other two forever.
+  complete(): finishes each calibrator individually. An IMU whose detector
+      is not Stationary is finished with zero samples, so it fails
+      InsufficientSamples and keeps any previous result.
+  failSession(): keeps every previous result. With retryOnFailure (the
+      default) a new session starts immediately, and the failure is counted
+      and remembered.
+
+KEY RULE: nothing is calibrated without INERTIAL confirmation of stillness.
+The brief warned that "altitude not changing" does not mean "still". Test
+prep_session_steady_barometer_alone_never_calibrates: with no IMUs, the
+session ends with NoStationaryImu and the barometers stay uncalibrated.
+
+E.4 Worked example from the tests
+---------------------------------
+prep_gyrocal_known_offsets_with_noise_error_metric:
+  true bias (0.0123, -0.0311, 0.0047) rad/s = (+0.70, -1.78, +0.27) dps
+  noise sigma = 0.0015 rad/s per axis, 500 samples
+  result: |bias_hat - bias| = 1.99e-4 rad/s (0.011 dps)
+          reported standard error 6.5e-5 rad/s per axis (theory 6.7e-5)
+  The 3-axis error of 1.99e-4 is about 1.7 x sqrt(3) x 6.7e-5, which is
+  normal for a three-axis random error.
+prep_session_three_imus_different_signed_biases: three IMUs with different
+positive and negative biases through the whole session -> worst error
+1.34e-4 rad/s, completed exactly at 5.0 s.
+
+E.5 Why the ACCELEROMETER is not calibrated (single-pose limitation)
+---------------------------------------------------------------------
+At rest, the accelerometer reads  a = -g_sensor + b , where g_sensor is
+gravity expressed in the chip's axes and b is the offset.
+  * We know |g_sensor| = 9.81, but not its DIRECTION, because the
+    orientation is unknown.
+  * That is 3 unknown offsets + 2 unknown direction angles = 5 unknowns,
+    against 3 measured numbers. The system cannot be solved.
+  * The tempting shortcut, "offset = mean - (0, 0, -9.81)", silently ASSUMES
+    the board is perfectly level with Z vertical. Any tilt would be
+    "calibrated" into a fake offset (1 deg of tilt = 0.17 m/s^2 of error),
+    and every later reading would be wrong.
+What IS possible later: a multi-orientation procedure (e.g. place the module
+on each of its 6 faces). Each pose gives |a| = g with a different unknown
+direction, and together they determine offset and scale.
+AccelCalibration (Calibration.hpp) is the interface for that:
+  calibrated = scaleMisalignment x (measured - bias), valid = false by default.
+applyAccelCalibration() returns the measurement unchanged while valid is
+false. The pipeline applies it per IMU (setAccelCalibration()), and every
+frame carries quality::AccelNotCalibrated until all three are valid. The
+driver's factory sensitivity (mg/LSB) is still used. No constant was
+invented.
+
+E.6 Memory, timing, tests
+-------------------------
+  GyroBiasCalibrator about 150 B, x3. CalibrationController total 3 408 B
+  (host sizeof; mostly the three detectors).
+  Timing: O(1) per sample; finish() runs once per session.
+  Tests (session and gyro): known offsets with error metric; positive and
+  negative biases on 3 IMUs; noise; interrupted by motion; different
+  offsets per IMU; missing IMU; repeated requests (old bias kept while the
+  new session collects, then replaced); failure when there is never 5 s of
+  stillness (timeout with and without retry); too noisy / implausible.
+
+
+===============================================================================
+F. COORDINATE ALIGNMENT
+===============================================================================
+
+Files: Components/Processing/AxisAlignment.hpp / .cpp
+       Components/Processing/VectorMath.hpp (Mat3f, rotationX/Y/Z)
+
+F.1 The frames
+--------------
+SENSOR frame: the chip's own X/Y/Z, as printed in its datasheet. This is
+what the drivers publish.
+
+BODY frame, chosen: FRD, right-handed
+  +X forward (the direction the pilot faces)
+  +Y right
+  +Z down
+At rest and level the accelerometer reads (0, 0, -9.81). It points UP,
+because it measures the force holding the device up against gravity.
+Why FRD: it is the aerospace convention that pairs with NED
+(North-East-Down). The standard attitude matrix R_nb (body -> NED) is then
+directly what Madgwick-type filters produce.
+
+NAVIGATION frame: the project expects ENU (East-North-Up). The conversion is
+two explicit steps, and they are never mixed silently:
+  v_NED = R_nb x v_body                    (R_nb: future attitude filter)
+  v_ENU = C x v_NED,  C = kEnuFromNed = | 0 1  0 |
+                                        | 1 0  0 |
+                                        | 0 0 -1 |
+  i.e. east = NED y, north = NED x, up = -NED z.
+C is its own inverse and has determinant +1. Swapping two axes (-1) and
+negating one (-1) give +1 together: it is the 180 deg rotation about the
+line halfway between North and East. (An earlier comment in the code
+claimed -1. The test caught it, and the comment was fixed.)
+Example: NED velocity (3 north, 4 east, 1 down) -> ENU (4, 3, -1).
+
+F.2 Mounting matrices
+---------------------
+For each IMU and the magnetometer:  v_body = R x v_sensor, where
+R = R_body_from_sensor.
+The SAME R is applied to an IMU's accelerometer AND its gyro (both are on
+one die and share one axis triad). See PreprocessingPipeline.cpp lines
+158-159.
+Example: chip rotated +90 deg about Z,  R = rotationZ(90 deg) =
+  | 0 -1 0 |
+  | 1  0 0 |   sensor (1,0,0) -> body (0,1,0): the chip's X points to body right.
+  | 0  0 1 |
+
+F.3 What makes a matrix acceptable (isProperRotation, lines 26-44)
+-------------------------------------------------------------------
+  1. all 9 entries finite;
+  2. R x R^T = I within 1e-4 per entry (line 35). The columns are
+     perpendicular unit vectors, which is exactly "preserves lengths and
+     angles";
+  3. det(R) = +1 within 1e-4 (line 44). No mirror image.
+Why reject det = -1: flipping ONE axis turns a right-handed frame into a
+left-handed one. No way of soldering a chip can do that, so such a matrix
+means a typo in the configuration. Flipping TWO axes (a chip on the
+underside of the board = 180 deg about X: y -> -y, z -> -z) is a real
+rotation and is accepted.
+setMounting() (line 63) rejects bad matrices (and sensors with no vector
+output, such as barometers), KEEPS the previous mounting, and counts the
+rejection.
+fromAxisMap() (line 47) builds R from a table like "body X = +sensor Y,
+body Y = -sensor X, body Z = +sensor Z", which is the usual way to turn a
+PCB drawing into a matrix. Line 54 puts the sign at row k, column `axis`.
+No Euler-angle function is offered. The order of Euler angles (XYZ vs ZYX,
+intrinsic vs extrinsic) is a classic source of silent errors. To compose
+rotations, write the product explicitly: R = Rz x Ry x Rx means "about X
+first, then Y, then Z, all about fixed axes".
+
+F.4 The placeholder - stated plainly
+------------------------------------
+The constructor (line 13) sets every mounting to the IDENTITY with
+verified = false, because the PCB orientation is UNKNOWN. Every frame
+carries quality::MountingUnverified until real values are installed with
+verified = true. Nothing in the code claims to know the board axes.
+Hardware procedure: HARDWARE_INTEGRATION_TODO.md section 12.
+
+F.5 Tests (9)
+-------------
+identity flagged unverified; 90 deg about X/Y/Z; 180 deg = two-axis flip
+(compared with rotationX(pi)); single-axis flip rejected; permutations
+(including a repeated axis and a zero sign, both rejected); magnitude
+preserved for 200 random vectors; scaled / sheared / singular / NaN
+matrices rejected; three IMUs mounted three different ways all agree in the
+body frame after alignment (accelerometer and gyro); NED->ENU and the FRD
+gravity sign.
+
+
+===============================================================================
+G. BAROMETRIC REFERENCE CALIBRATION
+===============================================================================
+
+Files: Components/Processing/Calibration.hpp / .cpp (BaroReferenceCalibrator, baro::)
+
+G.1 Purpose
+-----------
+During the same still window as the gyro calibration, each BMP585
+independently estimates its reference pressure P0, the pressure "here, now".
+Afterwards each barometer reports height RELATIVE to that point.
+
+G.2 BaroReferenceCalibrator
+---------------------------
+  begin(start) / restart(start): reset the statistics and the 1 s segments.
+  add(t, p): ignores NaN and p <= 0; Welford update plus segment means.
+  finish(now, sessionId), line 104:
+     line 111: the reference is set INVALID first; it only becomes valid again on success
+     n < 200 (5 s at 50 Hz = 250 expected, 80 %)        -> InsufficientSamples
+     mean not finite or <= 0                            -> InvalidValue
+     std > 10 Pa  (about 0.85 m)                        -> TooNoisy
+     spread of 1 s segment means > 12 Pa (about 1 m),
+       line 129                                         -> Drifting
+     otherwise store P0 = mean (double), std, spread, samples, time,
+     sessionId and scale height (G.5).
+
+G.3 The formula (specified by the brief)
+----------------------------------------
+  h_rel = 44330 x [ 1 - (P / P0)^0.1903 ]          (Calibration.cpp line 172)
+In words: in the standard atmosphere, pressure falls with height along a
+known curve. 0.1903 = R x L / (g x M) (gas constant x temperature lapse
+rate / (gravity x molar mass of air)), and 44330 m = T0 / L = 288.15 K /
+0.0065 K/m.
+Worked example: P0 = 101325 Pa, P = 101213 Pa (112 Pa lower)
+  P/P0 = 0.998895;  ^0.1903 -> 0.999790;  1 - that = 0.000210;  x 44330 = 9.33 m
+Rule of thumb: near sea level, 1 m is about 12 Pa, and 1 hPa is about 8.3 m.
+Double precision is used: P/P0 is very close to 1, and the result is a
+small difference of numbers close to 1.
+pow() runs only in the processing task (2 barometers x 50 Hz = 100 calls/s),
+never in the acquisition task or the driver.
+
+G.4 Independent references, same session, and why a failure INVALIDATES
+------------------------------------------------------------------------
+Each barometer has its own P0, so a constant offset between the two chips
+(manufacturing tolerance) cancels: each reads 0 m at the calibration point.
+Test prep_session_two_baros_independent_references_with_offset: a 35 Pa
+offset (about 3 m in absolute terms) gives P0 values 35 Pa apart, and both
+relative altitudes agree.
+Both references carry the sessionId. The pipeline compares only barometers
+whose references come from the SAME (newest) session
+(PreprocessingPipeline.cpp line 289). Their zeros then refer to one place
+and time.
+If a new session fails for one barometer, that barometer's reference becomes
+INVALID instead of keeping the old one. Otherwise barometer 0 could be
+zeroed at the launch site and barometer 1 still at the car park: they would
+"disagree" by the height difference and confuse the voter. This is
+"do not silently switch reference frames", enforced in code.
+A session that times out (no result at all) keeps the previous, mutually
+consistent references.
+
+G.5 A finding about the specified formula (please read for the review)
+----------------------------------------------------------------------
+44330 m uses the SEA-LEVEL temperature (288.15 K). Relative to a reference
+at altitude h0, the formula overstates height differences by the factor
+44330 / (44330 - h0):
+  take-off at 1500 m, true climb 300 m  ->  formula gives 310.5 m (+3.5 %).
+Test prep_baro_formula_high_takeoff_scale_error_and_isa_option computes the
+expected value independently and confirms this.
+The code offers BaroCalibrationConfig::altitudeModel:
+  StandardSeaLevelScale  (DEFAULT, the specified formula)
+  IsaAtReference         scale = 44330 x (P0/101325)^0.1903 = ISA temperature at P0 / L
+                         -> exactly 300.0 m in the same test.
+Both still ignore the REAL air temperature. A day 20 K warmer than ISA
+changes the scale by about 7 %, which is more than the difference between
+the two models. That is why the default was left as specified, and why the
+choice is recorded as a hardware/flight-test decision.
+
+G.6 Weather - a limitation that preprocessing cannot remove
+-----------------------------------------------------------
+Weather changes pressure by about 1 hPa over hours. With the device sitting
+still, that reads as 8.3 m of "climb" (prep_e2e_slow_weather_drift_appears_as_altitude_change).
+Preprocessing cannot tell weather from height. A future estimator must
+(GNSS altitude, the LiDAR near the ground, a drift state in the UKF). The
+frame's barometric altitude is therefore described as a BASELINE relative
+estimate, not a navigation solution.
+
+G.7 Tests (barometer-related, 11)
+---------------------------------
+reference -> 0 m and known points via the INVERSE formula; the high-site
+scale error and the ISA option; zero / negative / NaN pressure; mean, count
+and variance; too noisy; carried up 2 m in 5 s (Drifting) vs weather-rate
+drift (accepted); insufficient samples; offset between barometers; one
+barometer missing; samples before a motion discarded.
+End to end: a 100 m climb at 5 m/s is tracked with a worst error of 0.22 m.
+
+
+===============================================================================
+H. REDUNDANT SENSOR VALIDATION
+===============================================================================
+
+Files: Components/Processing/RedundancyVoter.hpp / .cpp
+
+H.1 Purpose
+-----------
+Three IMUs and two barometers measure the same physical quantities. The
+voter decides:
+  * whether they agree;
+  * which ones to use;
+  * whether a faulty one can be identified;
+  * when to stop trusting a sensor, and when to trust it again.
+One voter instance is used per quantity: accelerometer (3), gyro (3),
+barometric altitude (2, passed as the vector {h, 0, 0}). The brief asked
+for acceleration and angular rate to be compared separately, and a sensor
+can fail in one channel only.
+
+H.2 Inputs / outputs
+--------------------
+  update(VoteInput in[3], bool newData) -> VoteResult
+    VoteInput: available (fresh, valid, calibrated, aligned), value, timestamp
+    VoteResult: status, valid, value, timestamp (newest) and oldest,
+                candidate/contributing/excluded/outlier/skewed masks,
+                partialAgreement, maxPairDifference
+Masks are bit i = sensor i, so 0x5 = IMU0 and IMU2. The frame copies them,
+so "exactly which sensors contributed" is always reported.
+
+H.3 One update, step by step (RedundancyVoter.cpp)
+--------------------------------------------------
+1. Candidates. A sample more than maxSkewMs older than the newest candidate
+   (line 63) is not compared (skewedMask): it describes another instant.
+2. Agreement (line 94, agree() at line 30):
+      |v_i - v_j| <= absTolerance + relTolerance x max(|v_i|, |v_j|)
+   The relative part matters during large signals. At 4 g, two good IMUs
+   with 1 % sensitivity error differ by about 0.4 m/s^2 just from scale.
+3. Voters = candidates not EXCLUDED. With 3 voters, sensor i is this
+   update's OUTLIER if it disagrees with BOTH others WHILE those two agree
+   (line 112). That is majority evidence.
+4. Output table:
+     3 contributors, all 3 pairs agree    -> mean,              Healthy
+     3 contributors, 2 of 3 pairs agree   -> component median,  Degraded (partialAgreement)
+        (a "chain": A~B and B~C, but A!~C, so nobody is clearly wrong)
+     3 contributors, no pair agrees       -> no output,         Ambiguous
+     2 contributors agree                 -> mean,              Healthy only if 2 is ALL
+                                                                configured sensors (barometers);
+                                                                Degraded for IMUs
+     2 contributors disagree              -> no output,         Ambiguous (nobody blamed)
+     1 contributor                        -> that one,          Degraded (cannot be cross-checked)
+        ... unless a sensor that is RE-QUALIFYING disagrees with it (line 139):
+            that is a 1-vs-1 conflict, so no side is picked -> Ambiguous
+     0 candidates                         -> no output,         Unavailable
+5. Persistence and hysteresis (only when newData is true, so the same
+   sample is never counted twice):
+     outlier 5 times IN A ROW            -> EXCLUDED (line 196)
+     excluded but agrees with the output
+     20 times in a row                    -> re-included (line 210)
+     absent for 10 updates               -> must RE-QUALIFY on return
+                                            (20 agreements) before contributing (line 76)
+   For barometers: 3 / 10 / 5 (they update at 50 Hz).
+   A single bad sample is left out of THAT sample's value (it is obviously
+   wrong right now), but it never changes the SELECTION (the excluded set).
+   That is how "avoid changing selection on a single noisy sample" is met
+   without averaging in a value we already know is wrong.
+
+H.4 Worked example (IMU accelerometer x-components, z = -9.81 on all)
+---------------------------------------------------------------------
+  IMU0 0.10   IMU1 0.15   IMU2 3.20  (m/s^2)
+  tolerance for pairs with IMU2 = 1.0 + 0.05 x 10.32 = 1.52
+  |0-1| = 0.05 agree;  |0-2| = 3.10 disagree;  |1-2| = 3.05 disagree
+  -> IMU2 is the outlier; output = mean(IMU0, IMU1) = 0.125; status Degraded;
+     contributingMask 0x3, outlierMask 0x4.
+  If this continues for 5 consecutive new samples, excludedMask becomes 0x4.
+  If IMU2 then agrees for 20 consecutive samples, it is re-included and
+  the status returns to Healthy.
+End-to-end (prep_e2e_biased_imu_detected_excluded_output_unaffected): a
+0.3 rad/s (17 dps) gyro fault on IMU1 is excluded after 5 frames (50 ms).
+The fused output never moved more than 0.005 rad/s from the truth. The
+accelerometers stayed Healthy with all three IMUs, because the fault was
+in the gyro only, and that is why the channels are voted separately. After
+the fault cleared, IMU1 came back after about 200 ms.
+
+H.5 Barometers: two sensors cannot isolate a fault
+--------------------------------------------------
+With two barometers disagreeing by more than 2 m, there is no majority.
+The code does NOT guess: the altitude is invalid and the status Ambiguous,
+for as long as they disagree. Neither is blamed or excluded
+(prep_vote_two_baros_disagree_ambiguous_neither_blamed).
+One barometer missing -> Degraded, using the other.
+When a barometer returns after an absence, it must agree 10 times before it
+contributes, so the output cannot jump. The frame raises
+quality::BaroSourceChanged once at the moment the contributing set changes.
+A consumer can then expect a step of up to the 2 m tolerance.
+
+H.6 What voting can NOT do (say this in the review)
+---------------------------------------------------
+Majority voting assumes faults are independent. If two IMUs fail the SAME
+way (shared supply glitch, shared SPI fault, same temperature error), they
+out-vote the healthy third.
+prep_e2e_two_imus_fail_same_way_common_mode_limit demonstrates exactly this.
+The healthy IMU2 gets EXCLUDED, and the output follows the faulty pair. The
+voter detects INCONSISTENCY; it cannot prove CORRECTNESS. The mitigations
+are hardware-level (separate supplies/buses, different part numbers) or
+physics-level (cross-checks against GNSS and the barometer in the future
+estimator).
+
+H.7 Tolerances (all in ProcessingConfig.hpp, none tuned)
+--------------------------------------------------------
+  accelerometer: 1.0 m/s^2 + 5 %
+     (offsets of tens of mg; lever arm w^2 r = 0.5 m/s^2 at 5 rad/s with 2 cm
+      between chips; sample-time skew)
+  gyro:          0.05 rad/s + 5 % (after calibration)
+  barometer:     2.0 m
+Re-derive these from measured IMU-to-IMU differences on the real board.
+
+H.8 Memory, timing, tests
+-------------------------
+  88 B per voter, 3 voters. update() is about 1.7 KB of code. Its work is
+  fixed: 3 pairs, 3 x 3 flags.
+  16 unit tests + 7 end-to-end tests (see K).
+
+
+===============================================================================
+I. ProcessedSensorFrame
+===============================================================================
+
+File: Components/Processing/ProcessedSensorFrame.hpp (420 bytes, trivially copyable)
+
+I.1 Contents (line 156)
+-----------------------
+  sequence, timestampMs        frame counter and build time (MCU ms)
+  bodyFrame = FrdBody, timeDomain = McuMillis
+  specificForce_mps2           VectorEstimate (struct at line 67): value
+                               (body FRD, gravity NOT removed), timestamp,
+                               age, sample spread, max disagreement, status,
+                               candidate/contributing/excluded/outlier
+                               masks, partialAgreement, valid
+  angularRate_radps            VectorEstimate (body FRD, bias removed)
+  gyroDtMs, gyroDtValid        time step between consecutive angular-rate outputs
+  baroAltitude_m               ScalarEstimate (struct at line 83)
+  imu[3]                       each IMU on its own: body accel/gyro, age,
+                               fresh, usable flags, last reject reasons,
+                               gyro calibration state
+  baro[2]                      pressure, relative altitude, reference P0,
+                               age, fresh, altitudeValid, reference state,
+                               reasons
+  mag                          body-frame field (NOT iron-calibrated), age, valid
+  gnss                         latest fix pass-through, both time domains, valid
+  lidar                        latest range pass-through, valid
+  calibrationState, lastCalibrationFailure, calibrationSessionId
+  qualityFlags                 quality:: bits (line 42), see below
+  samplesLostSinceLastFrame, samplesRejectedSinceLastFrame
+
+I.2 Quality flags (one bit each)
+--------------------------------
+  MountingUnverified, AccelNotCalibrated, GyroNotCalibrated,
+  CalibrationInProgress, SamplesLost, SamplesRejected,
+  ImuDegraded / ImuAmbiguous / ImuUnavailable,
+  BaroDegraded / BaroAmbiguous / BaroUnavailable / BaroNoReference / BaroSourceChanged,
+  MagUnavailable, MagNotIronCalibrated, GnssUnavailable, LidarUnavailable,
+  NoNewImuData.
+Example of a typical frame RIGHT NOW (no hardware data, calibrated in
+simulation): qualityFlags contains MountingUnverified | AccelNotCalibrated |
+MagNotIronCalibrated | GnssUnavailable | LidarUnavailable | MagUnavailable.
+That is honest: those things really are not verified or available.
+
+I.3 Rules for using a frame
+---------------------------
+  * Use a value ONLY if its valid flag is true.
+  * Check the age if timing matters.
+  * Check qualityFlags for the conditions your algorithm cares about.
+  * Never treat 0 as "no data". An invalid value may contain anything.
+gyroDtValid is true only when two consecutive VALID angular-rate outputs
+exist, the newer one has genuinely newer data, and 0 < dt <= 50 ms
+(PreprocessingPipeline.cpp line 228). A Madgwick filter must not integrate
+otherwise.
+
+I.4 How it is built (PreprocessingPipeline::buildFrame, line 372)
+-----------------------------------------------------------------
+  line 374: f = {} (all zero / invalid)
+  fillImu (line 186): per-IMU info; voter inputs; the gyro input is
+           allowed only if that IMU has a valid bias (line 212-213,
+           requireGyroCalibration = true); two votes (line 216); dt; flags.
+  fillBaro (line 254): finds the newest reference session; only
+           barometers with a fresh sample AND a reference from that session
+           vote (line 289); BaroSourceChanged (line 319).
+  fillOthers (line 329): magnetometer, GNSS, LiDAR freshness and pass-through.
+  then the calibration fields, frame-level flags and counters; the "new
+  data" flags reset (line 400).
+
+I.5 Ownership and lifetime
+--------------------------
+The task owns one work frame (built in place, not on the stack) and the
+mailbox owns one published copy. Readers copy it out. No pointers into
+pipeline state are ever handed out.
+
+
+===============================================================================
+J. FREERTOS TASK INTEGRATION
+===============================================================================
+
+Files: Components/Tasks/SensorProcessingTask.hpp / .cpp
+       Components/Tasks/TaskConfig.hpp (lines 44-71)
+       Components/SysCore/RunInterface.cpp (lines 53-61)
+       Components/Tasks/HealthMonitorTask.cpp (line 117 onwards), SystemHealth.hpp
+
+J.1 Why a separate task
+-----------------------
+SensorAcquisitionTask must keep its 10 ms rhythm (priority 40). If
+calibration, alignment, voting and pow() ran inside it, a slow path could
+delay a sensor read. SensorProcessingTask runs at priority 32: below
+acquisition, so it can never preempt a sensor read, and above the health
+monitor (16). Both orderings are enforced at compile time with static_assert
+(TaskConfig.hpp lines 69-70).
+
+J.2 Data path
+-------------
+At start-up, before the scheduler runs (RunInterface.cpp line 56):
+  queue_.create()                                   static FreeRTOS queue, 64 x 88 B
+  hub.subscribe(&queue_, OverflowPolicy::DropOldest)
+  xTaskCreateStatic(... "SensorProc", 1024 words, priority 32 ...)
+  health.watchTask(processing.handle(), "SensorProc")   (line 61)
+Every acquisition cycle: hub.publish(msg) copies the message into this queue
+(0-tick send, never blocks). If the queue is full, the OLDEST queued
+message is dropped to make room (DropOldest). The hub counts it, and the
+pipeline sees it as a sequence gap.
+
+J.3 The loop (SensorProcessingTask::Run, from line 54)
+------------------------------------------------------
+  line 57: pipeline_.start(now) -> the start-up calibration session begins
+  forever:
+    line 63: popWait(msg, 50 ms)  BLOCKS (no CPU used) until a message arrives
+                                  or 50 ms pass
+    line 66: if another task called requestCalibration(), start a session
+             (a std::atomic<bool> flag, lock-free on Cortex-M7)
+    ingest the first message, then drain the rest (line 76), at most 64 per
+             wake: a bounded loop even if the producer keeps publishing
+    line 84: buildFrame()
+    line 85: frames_.publish(frame) into the ProcessedFrameMailbox
+    update stats: batches, messages, idle timeouts, largest batch,
+                  last/max processing time (1 ms resolution)
+Because acquisition has the higher priority, the processing task normally
+wakes right after an acquisition cycle ends, finds that whole cycle's burst
+(about 6-10 messages) in the queue, and produces ONE frame per cycle.
+If NO data arrives for 50 ms, it still produces a frame. That frame says
+ImuUnavailable / NoNewImuData etc., so a dead sensor bus is VISIBLE instead
+of silently freezing the last frame.
+
+J.4 Choosing the numbers
+------------------------
+  Priority 32   below acquisition (40), above defaultTask (24) and health (16).
+  Queue 64      production is about 575 messages/s = about 6 per 10 ms (RTOS_TIMING_ANALYSIS.md
+                section 7). 64 slots cover about 110 ms, i.e. about 10 cycles of
+                processing delay before DropOldest acts. Cost: 64 x 88 = 5.6 KB of static RAM.
+  Stack 1024 words (4 KB). The compiler's -fstack-usage reports the deepest
+                chain as Run 152 B -> fillImu 320 B -> RedundancyVoter::update 104 B,
+                about 0.65 KB plus the RTOS context frame. The margin is large, so
+                confirm with the Health task's stack high-water mark on hardware
+                and shrink later if wanted.
+  Idle 50 ms    long enough to never trigger while sensors run, short enough
+                that a total data loss shows up within 5 cycles.
+
+J.5 Thread safety
+-----------------
+  * The pipeline is touched ONLY by the processing task. No locks are needed.
+  * ProcessedFrameMailbox copies the frame in and out inside
+    taskENTER_CRITICAL (RtosCriticalSection). The copy is 420 B, estimated
+    at a few microseconds. Interrupts at priority >= 5 wait meanwhile. This
+    is acceptable, but should be measured; a double buffer is the
+    alternative.
+  * HealthMonitorTask reads the task's counters (each one aligned 32-bit
+    word) and copies the frame through the mailbox into a MEMBER variable
+    (HealthMonitorTask.cpp line 127), not onto its 2 KB stack.
+  * TSan test prep_concurrency_frame_mailbox_never_torn: one writer, one
+    reader, 20 000 frames. The reader never saw a half-written frame, and
+    the sequence never went backwards.
+
+J.6 What the health monitor now shows (g_systemHealth, debugger Live Expressions)
+---------------------------------------------------------------------------------
+processingBatches, processingMessages, processingIdleTimeouts,
+processingMaxBatch, processingLast/MaxTimeMs, frameSequence, frameAgeMs,
+frameQualityFlags, calibrationState / Failure / SessionId,
+accelStatus / gyroStatus / baroStatus (RedundancyStatus numbers:
+0 Unavailable, 1 Healthy, 2 Degraded, 3 Ambiguous), contributing masks,
+imuGyroCalibration[3] and baroReferenceState[2] (CalibrationState numbers:
+0 NotCalibrated, 1 Collecting, 2 Valid, 3 Failed), and the SensorProc
+stack high-water mark. The processing queue also appears in
+queueUsed / queueCapacity, because it is a hub subscriber.
+
+J.7 Memory and CPU
+------------------
+  SensorProcessingTask object: 16 144 B static (stack 4 KB, queue 5.6 KB,
+  pipeline 5.3 KB, two frames).
+  Firmware .bss: 28.3 -> 45.2 KB of 512 KB. FreeRTOS heap: not used by the new code.
+  Flash (Release): 16.5 -> 37.7 KB of 2 MB. Of that, 13.6 KB is the new
+  code, and about 7.8 KB is the C library's pow() with its tables.
+  CPU: host-measured 0.24 us per cycle on a laptop. The target ESTIMATE is
+  0.1-0.4 ms per 10 ms cycle (1-4 % at 64 MHz). Caches are not enabled in
+  main.c, so code runs from flash with wait states. NOT measured: toggle a
+  GPIO on hardware.
+
+
+===============================================================================
+K. SIMULATION AND TESTING
+===============================================================================
+
+K.1 The simulator (Tests/sim/SensorSimulator.hpp)
+-------------------------------------------------
+It produces the same SensorMessage stream the acquisition task would:
+per-sensor rates and phases (barometer 1 offset by 10 ms, as in reality),
+per-sensor sequence numbers, and MCU timestamps.
+  * Truth is defined in the BODY frame as functions of time: angularRate(t),
+    specificForce(t), altitude(t), referencePressure(t) (weather).
+  * Each IMU sees the truth through the TRANSPOSE of its mounting matrix,
+    then adds its own bias, offset and noise. So the test checks that the
+    pipeline's alignment undoes a rotation it did not create itself.
+  * Pressure is generated with the INVERSE formula,
+    P = P0 (1 - h/44330)^(1/0.1903). The pipeline's forward formula is
+    therefore checked against an independent expression, not against
+    itself.
+  * Noise comes from its own xorshift64* generator plus Box-Muller.
+    std::normal_distribution is NOT used, because its output differs between
+    C++ standard libraries, and every run must give identical numbers.
+  * Faults: invalid flag, NaN, saturation, step bias (gyroFaultBias /
+    accelFaultBias / faultPa), missing reads (no sequence step), LOST
+    samples (sequence consumed, message not delivered), delayed and
+    jittered timestamps, random outliers, absent sensors, and recovery
+    (toggle any of these between runs).
+  * Scheduling is relative to the first step. (A bug found and fixed:
+    "now % 10" breaks across the 2^32 wrap because 2^32 is not a multiple
+    of 10.)
+
+K.2 The test suites (85 new tests, all 205 pass)
+------------------------------------------------
+  validation 15 | calibration and stationary 27 | alignment 9 | redundancy 16 | pipeline/e2e 18
+Each module has unit tests; the pipeline file is the integration and
+end-to-end suite (SensorMessage in -> ProcessedSensorFrame out). The full
+list is in SENSOR_PREPROCESSING_TEST_REPORT.md section 2.
+The 120 tests from earlier milestones still pass, unchanged.
+
+K.3 Example: the main end-to-end test, line by line
+---------------------------------------------------
+prep_e2e_startup_calibration_then_calibrated_body_outputs:
+  1. Three IMUs with biases up to 0.031 rad/s and noise; barometers with 1 Pa noise.
+  2. start(0); run 2 s still. CHECK: specific force valid and Healthy; angular
+     rate NOT valid (no bias yet) with GyroNotCalibrated and
+     CalibrationInProgress set; calibrationState Collecting.
+  3. Run to 5.2 s. CHECK: calibration Valid; all three gyros Valid; both
+     barometer references Valid.
+  4. Rotate at (0.20, -0.10, 0.30) rad/s for 1 s. CHECK each frame: angular
+     rate valid; worst error 2.2e-3 rad/s (< 0.004); all three contribute;
+     specific force about (0, 0, -9.81); altitude about 0 m; dt = 10 ms and valid;
+     MountingUnverified, AccelNotCalibrated, MagNotIronCalibrated reported.
+
+K.4 Sanitizers and builds
+-------------------------
+  ASan + UBSan: 205/205.  TSan: 205/205, 0 warnings.  No sanitizers: 205/205.
+  STM32CubeIDE Debug and Release: 0 errors, 0 warnings.
+  An extra strict ARM compile of all new code with -Wextra -Wshadow -Wpedantic
+  gave 0 warnings in ParaGuardian code.
+  Link check: no undefined symbols, and no malloc/new/pvPortMalloc reference
+  from any new object file.
+
+K.5 Defects the tests found during development (honest record)
+--------------------------------------------------------------
+  1. The slow constant rotation was accepted as stillness. Fixed with the
+     per-axis accelerometer drift test (D.4).
+  2. The comment claiming det(NED->ENU) = -1 was wrong; it is +1. Fixed.
+  3. The specified barometric formula over-reads at high sites. Documented,
+     with an option added (G.5).
+  4. The calibration window now starts after the last moving sample.
+  5. The simulator's wrap bug (K.1). Two wrong test expectations were
+     corrected (excluded vs outlier masks; under heavy loss, calibration
+     completes LATER rather than never).
+No production code was changed only to make a test pass.
+
+
+===============================================================================
+L. FUTURE INTEGRATION WITH MADGWICK AND UKF
+===============================================================================
+
+L.1 Madgwick (attitude) - what it will read
+-------------------------------------------
+  angularRate_radps.value   body FRD, bias removed      (use only if valid)
+  gyroDtMs / gyroDtValid    integrate only if valid; dt = gyroDtMs / 1000
+  specificForce_mps2.value  body FRD, gravity included  (its direction gives "down" when not accelerating)
+  mag.fieldBody_uT          optional; NOT iron-calibrated yet (MagNotIronCalibrated)
+It produces R_nb (body -> NED) or a quaternion.
+The frame does NOT remove gravity. That needs the attitude, which is
+Madgwick's job. Free fall (|f| about 0) must be handled there: the
+accelerometer carries no attitude information then.
+
+L.2 UKF (vertical / navigation) - what it will read
+---------------------------------------------------
+  baroAltitude_m (relative, positive up, drifts with weather; check
+                  status and BaroSourceChanged)
+  vertical acceleration: (R_nb x specificForce)_down + g, computed AFTER
+                  Madgwick (not here)
+  gnss.* (heightMsl, velocities, accuracies), in their own time domain
+  lidar.distance_m (along the sensor boresight; tilt-correct with attitude
+                  before using it as height above ground)
+To convert to ENU, use pg::nedToEnu() (kEnuFromNed) only.
+
+L.3 How to hand frames to a new consumer
+----------------------------------------
+Simplest: poll SensorProcessingTask::Inst().frames().read(frame) and use
+frame.sequence to see whether it is new, and how many frames were missed.
+If a filter must see EVERY frame, add a bounded queue implementing
+IProcessedFrameSink in the processing task. The producer side does not
+change.
+
+L.4 What is deliberately NOT here
+---------------------------------
+No Madgwick, no Kalman/UKF, no aerodynamic model, no crash detection, no
+landing guidance, no SOS logic. These were excluded by the brief.
+
+
+===============================================================================
+APPENDIX 1. FILES
+===============================================================================
+Components/Processing/
+  VectorMath.hpp            Mat3f; vector and matrix helpers (reuses Vec3f)
+  ProcessingTypes.hpp       reject:: bits, statuses, frames, time domains
+  ProcessingConfig.hpp      every tunable value with its justification
+  TimeBase.hpp              wrap-safe time; IMeasurementTimeModel
+  RunningStats.hpp          Welford, 3-axis Welford, SegmentMeans
+  SampleValidator.*         section B
+  StationaryDetector.*      section D
+  Calibration.*             sections E and G
+  CalibrationController.*   section E.3
+  AxisAlignment.*           section F
+  RedundancyVoter.*         section H
+  ProcessedSensorFrame.hpp  section I
+  ProcessedFrameMailbox.hpp section J.5
+  PreprocessingPipeline.*   sections A, C, I
+Components/Tasks/SensorProcessingTask.*   section J
+Components/Acquisition/SampleFreshness.hpp  SequenceTracker::observeHeader (B.6)
+Tests/sim/SensorSimulator.hpp + Tests/unit/test_preprocessing_*.cpp   section K
+
+===============================================================================
+APPENDIX 2. UNVERIFIED UNTIL HARDWARE EXISTS
+===============================================================================
+  * Mounting matrices: identity placeholders.
+  * Every threshold: noise, bias, drift, agreement tolerances, skew, ages.
+  * Real execution time, stack high-water mark, critical-section length.
+  * Sensor latencies (all assumed 0); no MCU<->GNSS time mapping.
+  * Whether a wearer standing still passes the stationary test (body sway
+    may exceed 0.01 rad/s std; the device may have to be put down).
+  * The barometer altitude model at real sites and temperatures.
+  * Accelerometer and magnetometer calibration (not implemented by design).
+  * Behaviour of real sensor faults. The simulator only models the faults
+    we thought of.
+
+===============================================================================
+APPENDIX 3. LIKELY REVIEW QUESTIONS
+===============================================================================
+Q: Why not average all three IMUs?
+A: An average lets one bad sensor pull the result: a 3 m/s^2 fault moves a
+   3-way mean by 1 m/s^2. Voting identifies it and leaves it out (H.4).
+Q: Why the mean and not the median when all three agree?
+A: When all three agree within tolerance, the mean has the lowest noise
+   (noise shrinks by sqrt(3)). The median is used only for the "chain"
+   case, where it is more robust.
+Q: Two barometers disagree. Why not pick the one closer to the GNSS?
+A: That is fusion, the UKF's job. Preprocessing reports Ambiguous honestly
+   and lets the estimator decide with more information.
+Q: Why must the gyro be calibrated before any angular rate is output?
+A: An uncalibrated MEMS gyro can be off by around a degree per second;
+   integrated, that is about 60 deg of heading error per minute. The flag
+   requireGyroCalibration can be set false for experiments, and the frame
+   then still says GyroNotCalibrated.
+Q: What if the wearer never stands still for 5 s?
+A: There is no gyro output until they do (the frame says so). The session
+   completes at the first quiet 5 s and retries every 60 s otherwise.
+   Putting the module down at launch is the practical procedure; it must be
+   validated with real users.
+Q: Is 5 s enough?
+A: Bias error = sigma / sqrt(n): 500 samples give about 0.004 dps for
+   sigma = 0.086 dps. That is far below what a few minutes of flight needs.
+   The limiting factor will be temperature drift during flight, which
+   needs a temperature model or in-flight estimation later.
+Q: Why FRD and not ENU for the body frame?
+A: ENU is a NAVIGATION frame, not a body frame. FRD pairs with NED in the
+   standard attitude formulation, and the one-line NED->ENU matrix keeps
+   the project's ENU navigation outputs unambiguous.
+
+===============================================================================
+END
+===============================================================================
