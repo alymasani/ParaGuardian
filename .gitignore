@@ -1,0 +1,15 @@
+# STM32CubeIDE build output (regenerated on every build)
+Debug/
+Release/
+
+# Byte-identical macOS Finder duplicates moved out of the build tree
+.finder_duplicates_backup/
+
+# Compiler by-products
+*.o
+*.d
+*.su
+*.cyclo
+
+# macOS Finder metadata
+.DS_Store

@@ -1,0 +1,1781 @@
+===============================================================================
+ PARAGUARDIAN FIRMWARE WALKTHROUGH
+ A guided explanation of the code that actually exists in this repository
+===============================================================================
+
+Audience : an engineering student learning embedded programming.
+Use      : read top to bottom once, then use it as a lesson plan (Part L).
+Status   : written 2026-11-14. Everything described here COMPILES for the
+           STM32H743 (STM32CubeIDE, Debug and Release, 0 errors, 0 warnings)
+           and the portable parts PASS 98 host unit tests. NOTHING has been
+           run on real hardware. No part of this document is evidence that
+           the device is safe for paragliding use.
+
+How to read code references
+  "Components/Sensors/LSM6DSRX/Lsm6dsrx.cpp, Lsm6dsrx::init()" means: open
+  that file and find that function. Code excerpts are copied from the files;
+  "..." means lines were left out for brevity.
+
+Note on authorship: this code was generated with an AI assistant (Claude Code)
+at the student's request and must be reviewed, understood and owned by the
+team before use. Record this as your university's AI-use policy requires.
+
+
+TABLE OF CONTENTS
+  PART A  Project architecture
+  PART B  STM32CubeMX and the generated files
+  PART C  FreeRTOS fundamentals
+  PART D  CMSIS-RTOS V1 vs V2, and exactly what changed
+  PART E  SoarOS integration, start-up and task creation
+  PART F  I2C, SPI and UART communication (and the bus interfaces)
+  PART G  Sensor-by-sensor driver walkthrough
+           G1 common types   G2 LSM6DSRX   G3 BMP585   G4 MMC5983MA
+           G5 NEO-M9N (UBX)  G6 TF02-Pro
+  PART H  External flash and Bluetooth
+  PART I  Error handling, memory and concurrency
+  PART J  Testing and mocking
+  PART K  Hardware bring-up
+  PART L  Recommended learning exercises
+  APPENDIX  The full journey of one IMU sample
+
+
+===============================================================================
+PART A - PROJECT ARCHITECTURE
+===============================================================================
+
+A.1 What the firmware is for (this milestone)
+---------------------------------------------
+ParaGuardian is a paragliding safety module. This milestone builds the
+FOUNDATION only:
+  - the STM32 + FreeRTOS + SoarOS start-up,
+  - drivers for every sensor/peripheral chip,
+  - a sampling task that collects sensor data in SI units,
+  - diagnostics, tests and documentation.
+It deliberately does NOT contain a Kalman filter, an aerodynamic model, or
+landing guidance (Components/Algorithms/README.md explains the rules those
+will follow).
+
+A.2 Folder map
+--------------
+  ParaGuardian/
+  |- ParaGuardian.ioc          CubeMX configuration (the "source of truth" for pins/clocks)
+  |- Src/, Inc/, Startup/      CubeMX-generated C (main.c, freertos.c, FreeRTOSConfig.h, ...)
+  |- Drivers/, Middlewares/    ST HAL, CMSIS, FreeRTOS kernel (generated copies)
+  |- SoarOS/                   git submodule: the team's "Cube++" C++ framework (NOT modified)
+  |- Components/               ALL ParaGuardian C++ code
+  |   |- SystemDefines.hpp     configuration SoarOS requires from every project
+  |   |- SysCore/              C<->C++ entry points + CMSIS-V2 compatibility header
+  |   |- Common/               bus interfaces, status codes, byte helpers, ring buffer
+  |   |- Sensors/Common/       standard sample structs (SI units) + health counters
+  |   |- Sensors/LSM6DSRX/     IMU driver (x3 instances)
+  |   |- Sensors/BMP585/       barometer driver (x2 instances)
+  |   |- Sensors/MMC5983MA/    magnetometer driver
+  |   |- Sensors/NEOM9N/       GNSS UBX parser + NAV-PVT decoder
+  |   |- Sensors/TF02Pro/      LiDAR frame parser
+  |   |- Storage/W25Q128/      external NOR flash driver
+  |   |- Communications/Bluetooth/  EZ-Serial line framing + SOS record
+  |   |- Output/Audio, Output/LED, Power/   interfaces only (no schematic yet)
+  |   |- Acquisition/          portable glue: message type, queues, hub, sources
+  |   |- Tasks/                FreeRTOS tasks (acquisition, health monitor)
+  |   |- BSP/                  "board support": HAL adapters, RTOS clock, board wiring
+  |   `- Algorithms/           empty on purpose (README only)
+  |- Tests/                    host (laptop) unit tests + fakes, run_host_tests.sh
+  `- Docs/                     this file and the other reports
+
+A.3 Layers (who may call whom)
+------------------------------
+     +-------------------------------------------------------------+
+     | Tasks (FreeRTOS)      SensorAcquisitionTask, HealthMonitorTask|
+     +-------------------------------------------------------------+
+     | Acquisition (portable) SensorDataHub, ImuSource, BaroSource...|
+     +-------------------------------------------------------------+
+     | Drivers (portable)    Lsm6dsrx, Bmp585, Mmc5983ma, NeoM9n,    |
+     |                       Tf02Pro, W25q128, EzSerialLink           |
+     +-------------------------------------------------------------+
+     | Interfaces            ISpiDevice, II2cBus, IByteSource,        |
+     |                       IByteWriter, IClock, IRegisterBus        |
+     +-------------------------------------------------------------+
+     | BSP (STM32 only)      HalSpiDevice, HalI2cBus, HalUartPort,    |
+     |                       RtosClock, BoardConfig                   |
+     +-------------------------------------------------------------+
+     | ST HAL / FreeRTOS / SoarOS                                     |
+     +-------------------------------------------------------------+
+Arrows only point DOWN. A driver never includes "main.h" or calls HAL_*.
+That is what makes 98 tests possible on a laptop.
+
+"Portable" files (Common, Sensors, Storage, Communications, Acquisition)
+compile with any C++17 compiler. "Firmware-only" files (Tasks, BSP, SysCore)
+need FreeRTOS/HAL headers. Tests/run_host_tests.sh compiles only portable files.
+
+A.4 Why interfaces instead of calling HAL in every driver?
+----------------------------------------------------------
+Imagine Lsm6dsrx::init() called HAL_SPI_TransmitReceive(&hspi2, ...) and
+HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, ...) directly. Then:
+  1. It could not be written before the schematic exists (which SPI? which pin?).
+  2. Three IMUs would need three copies of the driver or a pile of #ifs.
+  3. It could not run on a laptop, so it could not be unit-tested.
+  4. Moving one IMU from SPI to I2C would mean rewriting the driver.
+With an interface, the driver says "I need something that can do
+writeThenRead()" and the board decides what that something is. This is called
+"dependency injection": the dependency (the bus) is handed in from outside,
+through the constructor.
+
+A.5 Naming conventions
+----------------------
+  pg::            namespace for all ParaGuardian code ("ParaGuardian")
+  pg::bsp::       board-support code (STM32-specific)
+  pg::board::     the wiring function
+  UPPER_CASE      constants (register addresses, limits)
+  camelCase()     functions; trailing underscore_ for private members
+  Status          return type of anything that can fail (Part I)
+
+
+===============================================================================
+PART B - STM32CUBEMX AND THE GENERATED FILES
+===============================================================================
+
+B.1 What CubeMX generated for this project
+------------------------------------------
+From ParaGuardian.ioc (read it - it is a text file):
+  Mcu.CPN=STM32H743ZIT6           the exact chip (LQFP144 package)
+  RCC.SYSCLKFreq_VALUE=64000000   64 MHz system clock
+  RCC_OSCILLATORTYPE_HSI          internal 64 MHz RC oscillator, PLL OFF,
+                                  NO external crystal (HSE) is used
+  VP_SYS_VS_tim6                  TIM6 is the HAL time base (not SysTick)
+  VP_FREERTOS_VS_CMSIS_V2         FreeRTOS with the CMSIS-RTOS **V2** wrapper
+  FREERTOS.Tasks01=defaultTask,24,128,...   one task: priority 24, 128 words
+  PA13/PA14                       SWDIO/SWCLK (the debugger) - the ONLY pins used
+There is no SPI, I2C, UART, ADC or timer for sensors yet: the schematic does
+not exist. The code never invents them.
+
+B.2 The generated files you must know
+-------------------------------------
+  Src/main.c                 main(): MPU, HAL_Init, clock, GPIO, RTOS start
+  Src/freertos.c             FreeRTOS application hooks (mostly empty here)
+  Src/stm32h7xx_hal_msp.c    low-level peripheral init (clocks/pins) called by HAL
+  Src/stm32h7xx_hal_timebase_tim.c   makes TIM6 the 1 ms HAL tick
+  Src/stm32h7xx_it.c         interrupt handlers (TIM6, faults)
+  Inc/FreeRTOSConfig.h       kernel configuration (heap size, priorities...)
+  Inc/stm32h7xx_hal_conf.h   which HAL modules are compiled
+  Startup/startup_stm32h743zitx.s   reset vector, .data/.bss init, calls main
+  STM32H743ZITX_FLASH.ld     linker script: where code and RAM live
+
+B.3 USER CODE regions - the golden rule
+---------------------------------------
+CubeMX REWRITES generated files every time you press "Generate Code". It
+keeps only text between matching markers:
+    /* USER CODE BEGIN xyz */
+    ... your code survives here ...
+    /* USER CODE END xyz */
+ParaGuardian changed Src/main.c in exactly three such regions:
+
+  /* USER CODE BEGIN Includes */
+  #include "../Components/SysCore/RunInterface.h"
+  /* USER CODE END Includes */
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  paraguardian_create_tasks();
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN 5 */                 (inside StartDefaultTask)
+  paraguardian_default_task();
+  /* USER CODE END 5 */
+
+Why a relative include ("../Components/...")? main.c is compiled by the C
+compiler, whose include paths are managed by CubeMX. A path relative to the
+file needs no extra setting, so regeneration cannot break it.
+
+B.4 The generated start-up sequence (Src/main.c, main())
+--------------------------------------------------------
+  MPU_Config();          memory protection: makes the unused low address
+                         range "no access" (catches null-pointer accesses)
+  HAL_Init();            resets peripherals, sets NVIC priority grouping,
+                         calls HAL_InitTick() -> configures TIM6 for 1 ms
+  SystemClock_Config();  power supply (LDO), voltage scale 3, HSI on,
+                         SYSCLK = HSI = 64 MHz, all bus dividers /1,
+                         FLASH_LATENCY_1 (wait states for 64 MHz)
+  MX_GPIO_Init();        only enables the GPIOA clock (for SWD)
+  osKernelInitialize();  CMSIS-V2: marks the kernel "Ready"
+  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+  paraguardian_create_tasks();      <- ours (USER CODE RTOS_THREADS)
+  osKernelStart();       starts the scheduler; never returns
+Each of these runs exactly once. ParaGuardian adds one call and never calls
+HAL_Init, SystemClock_Config, osKernelInitialize or osKernelStart itself.
+
+B.5 TIM6 as the HAL time base - why?
+------------------------------------
+FreeRTOS uses the Cortex-M SysTick timer for its own 1 ms tick. HAL also needs
+a 1 ms tick (HAL_GetTick, HAL_Delay, timeouts). If both used SysTick, FreeRTOS
+would own it and HAL timing would break whenever the scheduler is paused.
+So CubeMX gives HAL its own timer, TIM6:
+  Src/main.c, HAL_TIM_PeriodElapsedCallback():
+      if (htim->Instance == TIM6) { HAL_IncTick(); }
+Interrupt priorities (from the .ioc): TIM6 = 15, SysTick = 15, PendSV = 15.
+15 is the LOWEST urgency on this chip (4 priority bits: 0 = most urgent).
+
+B.6 Project build settings (CubeIDE's .cproject / .project)
+-----------------------------------------------------------
+The project was generated as a C-only project. This session:
+  - added the C++ "nature" to .project (CubeIDE now builds .cpp files),
+  - gave the G++ compiler the same defines as the C compiler
+    (USE_PWR_LDO_SUPPLY, USE_HAL_DRIVER, STM32H743xx, DEBUG in Debug),
+  - gave G++ the generated include paths plus ../Components, ../SoarOS,
+    ../SoarOS/Core/Inc, ../SoarOS/Drivers/Inc and the ETL include folder,
+  - set the C++ language standard to GNU++17 (-std=gnu++17),
+  - force-included ../Components/SysCore/SoarOSCmsisV2Compat.h (Part D),
+  - gave the G++ linker the linker script (with C++ sources CubeIDE links
+    with g++),
+  - added the source folders Components and SoarOS (excluding SoarOS parts
+    that need hardware we do not have: Profiler, UARTDriver.cpp,
+    UARTTask.cpp, CubeUtils.cpp; and Libraries which is header-only).
+C files are still compiled as C (gnu11) with untouched settings.
+CubeIDE's C++ defaults are kept: -fno-exceptions (no try/throw),
+-fno-rtti (no dynamic_cast/typeid), -fno-use-cxa-atexit (static
+destructors never registered - firmware never "exits").
+
+B.7 Memory map (STM32H743ZITX_FLASH.ld)
+---------------------------------------
+  FLASH     0x08000000  2 MB    code + constants
+  DTCMRAM   0x20000000  128 KB  fast, CPU-only (DMA1/2 CANNOT reach it)
+  RAM_D1    0x24000000  512 KB  AXI SRAM: .data, .bss, heap, main stack
+  RAM_D2    0x30000000  288 KB
+  RAM_D3    0x38000000  64 KB
+.data and .bss go to RAM_D1, so all our static buffers (task stacks, queues,
+ring buffers) are DMA-reachable later.
+Build size now: Debug text 25.9 KB, bss 27.3 KB; Release text 15.7 KB.
+
+
+===============================================================================
+PART C - FREERTOS FUNDAMENTALS
+===============================================================================
+
+C.1 Tasks
+---------
+A task is a function with its own stack that the scheduler runs as if it had
+the CPU to itself. FreeRTOS switches between tasks:
+  - preemptively (configUSE_PREEMPTION = 1): the highest-priority READY task
+    always runs; a higher-priority task becoming ready interrupts a lower one;
+  - on each tick (1 ms) between equal-priority tasks (time slicing).
+Task states: Running, Ready, Blocked (waiting for time or an event),
+Suspended. A task that calls vTaskDelay() or waits on a queue is Blocked and
+uses NO CPU. Good embedded tasks spend most of their time Blocked.
+
+C.2 Priorities in this project
+------------------------------
+configMAX_PRIORITIES = 56 (0..55). Higher number = more urgent.
+  SensorAcq   40 (osPriorityHigh)          sampling must be on time
+  defaultTask 24 (osPriorityNormal)        exits immediately
+  Health      16 (osPriorityBelowNormal)   diagnostics can wait
+  Timer svc    2 (configTIMER_TASK_PRIORITY)
+  Idle         0
+Note the timer service task is BELOW our tasks. We use no software timers, so
+that is fine; it is listed as a risk in CMSIS_V2_SOAROS_MIGRATION.md.
+
+C.3 Stacks, and why sizes are in WORDS
+--------------------------------------
+Each task has a private stack for local variables, return addresses and the
+saved CPU registers when it is switched out (including FPU registers on the
+M7). xTaskCreate()/xTaskCreateStatic() take the stack depth in WORDS; one
+word = sizeof(StackType_t) = 4 bytes on Cortex-M.
+  ACQUISITION_STACK_WORDS = 1024  -> 4096 bytes
+  HEALTH_STACK_WORDS      =  512  -> 2048 bytes
+CMSIS-V2's osThreadAttr_t.stack_size is in BYTES: CubeMX wrote 128 * 4 for
+defaultTask. Mixing these up gives a stack 4x too small or too big.
+The compiler's -fstack-usage report (Release) shows our biggest single frames:
+W25q128::write 312 B, LidarSource::service 200 B, GnssSource::service 192 B,
+so the stacks have a large margin. HealthMonitorTask measures the real margin
+at run time with uxTaskGetStackHighWaterMark() (Part E.7).
+
+C.4 Static vs dynamic allocation
+--------------------------------
+xTaskCreate() asks the FreeRTOS heap (pvPortMalloc) for the stack and TCB.
+xTaskCreateStatic() uses memory YOU provide:
+  StackType_t stack_[TaskConfig::ACQUISITION_STACK_WORDS] = {};
+  StaticTask_t tcb_{};
+  rtTaskHandle = xTaskCreateStatic(fn, "SensorAcq", 1024, this, 40, stack_, &tcb_);
+The FreeRTOS heap here is only configTOTAL_HEAP_SIZE = 15360 bytes (CubeMX
+default) - three 4 KB stacks would nearly exhaust it. Static allocation:
+  + cannot fail at run time for lack of memory,
+  + shows up in the linker's .bss size, so overflow of RAM is a LINK error,
+  + no fragmentation.
+configSUPPORT_STATIC_ALLOCATION = 1 is already set by CubeMX.
+
+C.5 Queues
+----------
+A queue is a thread-safe FIFO of fixed-size items. xQueueSend copies the item
+IN (by value), xQueueReceive copies it OUT. Because items are copied byte for
+byte, they must be "trivially copyable" (plain structs, no pointers to
+temporary data). Both functions take a timeout in ticks:
+  0             do not wait (return immediately if full/empty)
+  portMAX_DELAY wait forever
+ParaGuardian: RtosSampleQueue (Components/Tasks/RtosSampleQueue.hpp) uses
+xQueueCreateStatic and a 0 timeout for sending (sampling never blocks).
+
+C.6 Mutexes and semaphores
+--------------------------
+A mutex protects a shared resource (e.g. an SPI bus used by two tasks). Only
+the task that took it may give it back, and FreeRTOS applies PRIORITY
+INHERITANCE: if a low-priority task holds the mutex a high-priority task
+wants, the low one is temporarily boosted so it finishes quickly.
+SoarOS's Mutex class (SoarOS/Core/Inc/Mutex.hpp) wraps xSemaphoreCreateMutex.
+HalSpiDevice can optionally take one per transaction (Part F.5).
+
+C.7 Delays and fixed-rate loops
+-------------------------------
+vTaskDelay(n)            block for n ticks FROM NOW (drifts if work time varies)
+xTaskDelayUntil(&t, n)   block until t + n, then t += n (fixed rate, no drift)
+xTaskDelayUntil returns pdFALSE when the wake time had ALREADY passed - i.e.
+the previous cycle overran and a deadline was missed. SensorAcquisitionTask
+counts exactly that (Part E.6).
+
+C.8 Interrupts and FreeRTOS
+---------------------------
+configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY = 5. Interrupts with priority
+0..4 are never masked by the kernel but may NOT call any FreeRTOS function.
+Interrupts with priority 5..15 may call only "...FromISR" functions.
+Our UART adapter's ISR touches only a lock-free ring buffer, never FreeRTOS.
+
+C.9 The heap
+------------
+heap_4.c (Middlewares/Third_Party/FreeRTOS/Source/portable/MemMang/heap_4.c),
+15 360 bytes, first-fit with merging of free blocks. Users in this build:
+SoarOS's global vaListMutex, the HealthMonitorTask command queue (SoarOS
+Queue uses xQueueCreate), the CubeMX defaultTask (freed when it exits).
+HealthMonitorTask records xPortGetFreeHeapSize() and
+xPortGetMinimumEverFreeHeapSize().
+
+
+===============================================================================
+PART D - CMSIS-RTOS V1 vs V2, AND EXACTLY WHAT CHANGED
+===============================================================================
+
+D.1 What CMSIS-RTOS is
+----------------------
+CMSIS-RTOS is ARM's standard C API for RTOSes ("osThreadNew", "osDelay"...).
+ST wraps FreeRTOS in it so CubeMX can generate RTOS code. The kernel
+underneath is the same FreeRTOS in both versions. V1 is the old API; V2 is the
+current one and is what CubeMX 6.18 generated here.
+
+D.2 Why SoarOS did not compile out of the box
+---------------------------------------------
+SoarOS calls native FreeRTOS functions (xTaskCreate, xQueueSend,
+xSemaphoreTake, xTimerCreate). Those are identical under V1 and V2. What
+broke were two header-level assumptions:
+
+ 1) V1's cmsis_os.h included FreeRTOS.h, task.h, queue.h, semphr.h, timers.h.
+    V2's cmsis_os.h is literally:
+        #define osCMSIS 0x20001U
+        #include "cmsis_os2.h"
+    So SoarOS/Core/Inc/Mutex.hpp, which includes only "cmsis_os.h" and then
+    declares "SemaphoreHandle_t rtSemaphoreHandle;", fails: unknown type.
+
+ 2) SoarOS/Core/Inc/CubeUtils.hpp:
+        #define MS_TO_TICKS(time_ms) ((time_ms) * (osKernelSysTickFrequency / 1000))
+        constexpr uint32_t MAX_DELAY_MS = TICKS_TO_MS(portMAX_DELAY);
+    osKernelSysTickFrequency is a V1 MACRO (the tick rate in Hz). V2 replaced
+    it with a FUNCTION, osKernelGetTickFreq(), which cannot be used in a
+    constexpr. So this line does not compile.
+
+D.3 The fix: a force-included compatibility header
+--------------------------------------------------
+File: Components/SysCore/SoarOSCmsisV2Compat.h
+    #include "FreeRTOS.h"
+    #include "task.h"
+    #include "queue.h"
+    #include "semphr.h"
+    #include "timers.h"
+    #include "cmsis_os.h"
+    #if !defined(osCMSIS) || (osCMSIS < 0x20000U)
+    #error "SoarOSCmsisV2Compat.h is only for CMSIS-RTOS V2 projects"
+    #endif
+    #ifndef osKernelSysTickFrequency
+    #define osKernelSysTickFrequency configTICK_RATE_HZ
+    #endif
+    static_assert((configTICK_RATE_HZ % 1000U) == 0U, "...");
+Line by line:
+  - The five FreeRTOS includes restore exactly what V1's cmsis_os.h provided.
+  - The #error stops anyone from using this file in a V1 project by mistake.
+  - The #define gives the macro its V1 meaning: ticks per second (1000 here).
+  - The static_assert protects against a subtle bug in SoarOS:
+    1000 / 1000 = 1 is fine, but at 100 Hz, 100 / 1000 = 0 in INTEGER maths
+    and every MS_TO_TICKS(x) would silently become 0 (no waiting at all).
+"Force-included" means the CubeIDE option "Include files (-include)" is set
+for the G++ compiler: every .cpp file behaves as if its first line were
+#include "SoarOSCmsisV2Compat.h". Only C++ gets it; generated C is untouched.
+
+We deliberately did NOT write fake V1 functions (e.g. #define osThreadCreate
+...) because the two APIs differ in meaning (units, priorities, ownership),
+and SoarOS does not need them.
+
+D.4 Semantic differences that matter (table)
+--------------------------------------------
+  Topic          V1                               V2
+  -------------  -------------------------------  ---------------------------------
+  create thread  osThreadCreate(&osThreadDef..)    osThreadNew(fn, arg, &attr)
+  stack size     passed to xTaskCreate (words)    attr.stack_size in BYTES
+  priority       osPriorityNormal = 0 (7 levels)  osPriorityNormal = 24 (56 levels)
+  kernel init    not required                     osKernelInitialize() REQUIRED
+  start          osKernelStart()                  osKernelStart() only if state Ready
+  exit thread    osThreadTerminate(self)          osThreadExit() (never returns)
+  tick rate      macro osKernelSysTickFrequency   function osKernelGetTickFreq()
+  delay          osDelay(ms)                      osDelay(ticks)
+In ParaGuardian, only CubeMX's defaultTask uses the V2 thread API; our tasks
+use native FreeRTOS calls (like SoarOS), so "words" is the unit everywhere in
+our code.
+
+D.5 The start-up trap we avoided
+--------------------------------
+The SoarOS README (written for V1) says: put run_interface(); #if 0 in USER
+CODE 2 and #endif in USER CODE 3, so the generated RTOS start is skipped and
+run_main() calls osKernelStart() itself. Under V2 that would skip
+osKernelInitialize(). Look at Middlewares/.../CMSIS_RTOS_V2/cmsis_os2.c:
+    osStatus_t osKernelStart (void) {
+      ...
+      if ((state == taskSCHEDULER_NOT_STARTED) && (KernelState == osKernelReady)) {
+        SVC_Setup();
+        KernelState = osKernelRunning;
+        vTaskStartScheduler();
+        stat = osOK;
+      } else {
+        stat = osError;
+      }
+KernelState only becomes osKernelReady inside osKernelInitialize(). Without
+it, osKernelStart() returns osError and the scheduler NEVER starts - the board
+would sit in an infinite loop with no error message. ParaGuardian keeps the
+generated sequence and only inserts paraguardian_create_tasks() between
+osKernelInitialize() and osKernelStart().
+
+D.6 Priorities: expressed with V2 names
+---------------------------------------
+Components/Tasks/TaskConfig.hpp:
+    constexpr UBaseType_t ACQUISITION_PRIORITY = static_cast<UBaseType_t>(osPriorityHigh);  // 40
+    constexpr UBaseType_t HEALTH_PRIORITY = static_cast<UBaseType_t>(osPriorityBelowNormal); // 16
+    static_assert(ACQUISITION_PRIORITY < configMAX_PRIORITIES, "priority out of range");
+In V2, osPriority_t values are passed straight through to FreeRTOS, so using
+the names keeps native tasks and the CMSIS defaultTask on one consistent
+scale. SoarOS projects on V1 used raw numbers like 2 and 3; under V2 those
+would be below even osPriorityLow (8).
+
+
+===============================================================================
+PART E - SOAROS INTEGRATION, START-UP AND TASK CREATION
+===============================================================================
+
+E.1 What SoarOS (Cube++) gives us
+---------------------------------
+  Task        base class: owns an event queue (Queue*) and a TaskHandle_t
+  Command     message object passed through queues (command + optional data)
+  Queue       wrapper over a FreeRTOS queue of Command objects
+  Mutex       wrapper over a FreeRTOS mutex
+  Timer       wrapper over FreeRTOS software timers
+  SOAR_ASSERT / SOAR_PRINT   assertion + debug print macros (CubeDefines.hpp)
+  DataBroker  pub/sub for the rocket's message types (NOT used, see Part G.1)
+SoarOS was not modified. Its commit is 426c1ef on master.
+
+E.2 Components/SystemDefines.hpp - what SoarOS demands from us
+--------------------------------------------------------------
+Every SoarOS project must provide this file. SoarOS headers include it by
+bare name ("SystemDefines.hpp"), which works because ../Components is on the
+G++ include path.
+    #define DISABLE_DEBUG
+    #include "main.h"
+    #include "CubeDefines.hpp"
+    #include "UARTDriver.hpp"
+    constexpr UARTDriver* const DEFAULT_DEBUG_UART_DRIVER = nullptr;
+    enum GLOBAL_COMMANDS : uint8_t { COMMAND_NONE = 0, TASK_SPECIFIC_COMMAND,
+                                     DATA_COMMAND, DATA_BROKER_COMMAND };
+    constexpr uint8_t UART_TASK_RTOS_PRIORITY = 2; ... (needed by CubeTask.cpp)
+  - DISABLE_DEBUG: the PCB has no verified debug UART pins, so SOAR_PRINT
+    compiles to nothing and SOAR_ASSERT resets the MCU without printing. This
+    is the option the SoarOS README documents for "no debug UART".
+  - #include "main.h" first: brings in the HAL and device header, so
+    USART_TypeDef (used in UARTDriver.hpp) is known.
+  - Include order matters because UARTDriver.hpp itself includes
+    SystemDefines.hpp; include guards stop the loop.
+
+E.3 The C <-> C++ bridge (Components/SysCore/RunInterface.h/.cpp)
+-----------------------------------------------------------------
+C cannot call C++ functions directly because C++ "mangles" names (it encodes
+parameter types into the symbol name). extern "C" turns that off:
+    #ifdef __cplusplus
+    extern "C" {
+    #endif
+    void paraguardian_create_tasks(void);
+    void paraguardian_default_task(void);
+    #ifdef __cplusplus
+    }
+    #endif
+The #ifdef lets the same header be read by the C compiler (main.c) and the
+C++ compiler (RunInterface.cpp).
+
+E.4 paraguardian_create_tasks() line by line
+--------------------------------------------
+    namespace { bool s_tasksCreated = false; }
+An anonymous namespace makes the variable private to this .cpp file.
+
+    if (s_tasksCreated) { ++pg::g_systemHealth.startupErrors; return; }
+    s_tasksCreated = true;
+Guard: a second call would create a second thread on the SAME static stack -
+memory corruption. We refuse and record it.
+
+    SOAR_ASSERT(osKernelGetState() == osKernelReady, "...");
+Checks we are between osKernelInitialize() and osKernelStart(). This is a
+programming error if false, so an assert (reset) is appropriate.
+
+    SensorAcquisitionTask& acquisition = SensorAcquisitionTask::Inst();
+    pg::board::registerSensors(acquisition);
+    acquisition.InitTask();
+Inst() returns the single instance (the "singleton" pattern used by every
+SoarOS task). registerSensors() adds the wired sensors (none yet). InitTask()
+creates the FreeRTOS thread.
+
+    HealthMonitorTask& health = HealthMonitorTask::Inst();
+    health.watchTask(acquisition.handle(), "SensorAcq");
+    health.InitTask();
+
+    extern "C" void paraguardian_default_task(void) { osThreadExit(); }
+The CubeMX defaultTask was made with osThreadNew (V2), so it ends with the V2
+call osThreadExit(); FreeRTOS's idle task then frees its 512-byte stack.
+
+E.5 The singleton + trampoline pattern (SensorAcquisitionTask.hpp)
+-----------------------------------------------------------------
+    static SensorAcquisitionTask& Inst() {
+        static SensorAcquisitionTask inst;   // constructed on first call
+        return inst;
+    }
+    static void RunTask(void* pvParams) { SensorAcquisitionTask::Inst().Run(pvParams); }
+  - "static SensorAcquisitionTask inst;" inside a function: created the first
+    time Inst() runs (here: in paraguardian_create_tasks, before the scheduler,
+    so no thread-safety issue) and lives until power-off. Its members,
+    including the 4 KB stack array, live in .bss.
+  - FreeRTOS wants a plain function pointer "void fn(void*)". A normal member
+    function has a hidden "this" parameter, so it cannot be used. RunTask is a
+    static member (no "this") that jumps into the object's Run(). This is the
+    "trampoline".
+  - The constructor is private, copy constructor and assignment are deleted:
+    nobody can make a second instance.
+  - SensorAcquisitionTask() : Task(0u) {} - the SoarOS base with queue depth
+    0 means "no command queue" (this task needs none, and it saves heap).
+
+E.6 SensorAcquisitionTask::InitTask() and Run()
+-----------------------------------------------
+    rtTaskHandle = xTaskCreateStatic(&SensorAcquisitionTask::RunTask,
+                                     "SensorAcq",
+                                     TaskConfig::ACQUISITION_STACK_WORDS,  // WORDS
+                                     this,
+                                     TaskConfig::ACQUISITION_PRIORITY,
+                                     stack_,
+                                     &tcb_);
+    SOAR_ASSERT(rtTaskHandle != nullptr, "...");
+Parameters: entry function, name (debugger shows it), stack depth in words,
+argument passed to the entry (unused, Inst() is used instead), priority, the
+stack buffer, the task control block buffer. Returns the handle, or nullptr
+only if a buffer pointer is null.
+
+Run():
+    pg::IClock& clock = pg::bsp::systemClock();
+    const TickType_t period = pdMS_TO_TICKS(TaskConfig::ACQUISITION_PERIOD_MS); // 10
+    TickType_t lastWake = xTaskGetTickCount();
+    for (;;) {
+        if (xTaskDelayUntil(&lastWake, period) == pdFALSE) {
+            ++stats_.missedDeadlines;
+        }
+        const uint32_t cycleStart = clock.millis();
+        for (size_t i = 0; i < sourceCount_; ++i) {
+            sources_[i]->service(cycleStart, hub_);
+        }
+        const uint32_t elapsed = clock.millis() - cycleStart;
+        ++stats_.cycles;
+        if (elapsed > stats_.maxCycleTimeMs) stats_.maxCycleTimeMs = elapsed;
+        if (elapsed >= TaskConfig::ACQUISITION_PERIOD_MS) ++stats_.cycleOverruns;
+    }
+  - for (;;) - a task function must never return.
+  - Every 10 ms it asks each registered source to do whatever is due.
+  - sources_[i]->service(...) is a VIRTUAL call through the IAcquisitionSource
+    interface: the task does not know if it is an IMU or a LiDAR.
+  - Timing statistics are kept for the health monitor.
+Why one task for all sensors? Each extra task costs a stack and context
+switches; several tasks sharing one SPI bus need extra locking. One
+deterministic loop is easier to reason about. Each source still keeps its own
+rate (Part G.7).
+
+E.7 HealthMonitorTask (Components/Tasks/HealthMonitorTask.cpp)
+--------------------------------------------------------------
+This one DOES use the SoarOS command queue (depth 4):
+    void HealthMonitorTask::Run(void*) {
+        collect();
+        for (;;) {
+            Command cm;
+            if (qEvtQueue->Receive(cm, TaskConfig::HEALTH_PERIOD_MS)) {
+                handleCommand(cm);
+            }
+            collect();
+        }
+    }
+Receive(cm, 1000) blocks up to 1000 ms; if another task sends
+Command(TASK_SPECIFIC_COMMAND, HEALTH_CMD_COLLECT_NOW) it wakes early.
+handleCommand() ends with cm.Reset(); - SoarOS rule: every received Command
+must be Reset() so any heap data attached to it is freed.
+
+collect() fills the global snapshot pg::g_systemHealth:
+    h.freeHeapBytes = xPortGetFreeHeapSize();
+    h.minimumEverFreeHeapBytes = xPortGetMinimumEverFreeHeapSize();
+    const UBaseType_t freeWords = uxTaskGetStackHighWaterMark(watched_[i].handle);
+    h.tasks[i].lowStack = freeWords < TaskConfig::LOW_STACK_WARNING_WORDS;  // 64
+    ... acquisition cycles, missed deadlines, drops, queue occupancy,
+    ... per-sensor success/failure counters
+uxTaskGetStackHighWaterMark returns the SMALLEST amount of stack (in words)
+that has ever been free - FreeRTOS fills new stacks with 0xA5 and checks how
+much of that pattern is untouched.
+
+How to see it without a UART: in STM32CubeIDE, while debugging, open
+"Live Expressions" and add  pg::g_systemHealth . The variable is declared
+    __attribute__((used)) SystemHealthSnapshot g_systemHealth = {};
+"used" stops the linker from removing it even if no code reads it.
+
+Concurrency note: the acquisition task writes its counters without a lock
+and the health task reads them. Each counter is one aligned 32-bit word, so a
+read is never "torn" (half old, half new) on the Cortex-M7. The snapshot as a
+whole may mix adjacent cycles - fine for diagnostics.
+
+E.8 Kernel hook forwarders
+--------------------------
+    extern "C" void paraguardian_on_stack_overflow(TaskHandle_t, const char*);
+    extern "C" void paraguardian_on_malloc_failed(void);
+FreeRTOS calls vApplicationStackOverflowHook / vApplicationMallocFailedHook
+when those checks are enabled. CubeMX generates those hook functions in
+Src/freertos.c when you enable them, so defining them ourselves would cause a
+duplicate-symbol error later. Instead we provide forwarders to be called from
+the generated hooks' USER CODE (see HARDWARE_INTEGRATION_TODO.md section 10).
+
+E.9 A pre-scheduler subtlety you should be able to explain
+----------------------------------------------------------
+SoarOS has a global object:  Mutex Global::vaListMutex;  (CubeDefines.cpp).
+Global objects are constructed BEFORE main() by __libc_init_array (called
+from the startup assembly). Its constructor calls xSemaphoreCreateMutex(),
+which internally enters a FreeRTOS critical section. Before the scheduler
+starts, FreeRTOS deliberately leaves interrupts at priority >= 5 MASKED after
+such a call (it initialises uxCriticalNesting = 0xAAAAAAAA so it never
+reaches 0). TIM6 has priority 15, so the HAL tick does not advance until
+osKernelStart(). Consequence: HAL_Delay() before the scheduler would hang
+forever. CubeMX's init code does not call HAL_Delay, and ParaGuardian
+initialises sensors only inside tasks. RtosClock::delayMs() even contains a
+fallback busy-wait on the DWT cycle counter for this case (Part F.8). The
+team's DAQ board has the same property.
+
+
+===============================================================================
+PART F - I2C, SPI AND UART COMMUNICATION (AND THE BUS INTERFACES)
+===============================================================================
+
+F.1 SPI in one page
+-------------------
+SPI is a synchronous, full-duplex bus with four wires:
+  SCK  clock, driven by the master (the STM32)
+  MOSI master-out slave-in   (data to the sensor)
+  MISO master-in slave-out   (data from the sensor)
+  CSn  chip select, one per device, ACTIVE LOW
+On every SCK edge one bit moves each way. To read register 0x0F of the
+LSM6DSRX the master pulls CSn low and clocks 16 bits:
+  byte 1 MOSI: 1000 1111 = 0x8F   (bit 7 = 1 means READ, bits 6..0 = 0x0F)
+  byte 2 MOSI: 0000 0000 (dummy)  MISO: 0110 1011 = 0x6B (the answer)
+then releases CSn high. "Mode" (CPOL/CPHA) says which clock edge samples
+data. LSM6DSRX and W25Q128 support modes 0 and 3; confirm the mode for
+BMP585 and MMC5983MA in their datasheets before configuring CubeMX.
+
+F.2 I2C in one page
+-------------------
+Two open-drain wires, SDA and SCL, with pull-up resistors; devices are
+selected by a 7-bit ADDRESS sent at the start of each transfer.
+  write register:  START, addr+W, reg, value, STOP
+  read registers:  START, addr+W, reg, REPEATED-START, addr+R, data..., STOP
+A missing device does not ACKnowledge its address (NACK) -> HAL_ERROR ->
+Status::BusError. ST HAL wants the address shifted left by one (8-bit form):
+    HAL_I2C_Master_Transmit(hi2c_, static_cast<uint16_t>(address7 << 1), ...)
+
+F.3 UART in one page
+--------------------
+Asynchronous serial: no clock wire; both sides agree on a baud rate
+(e.g. 115200 bits/s). Frame: start bit, 8 data bits LSB first, stop bit
+("8N1") -> 10 bits per byte -> 11 520 bytes/s at 115200. Bytes arrive
+whenever the device sends them, so firmware must buffer them (Part F.7).
+
+F.4 The interfaces (Components/Common/BusInterfaces.hpp)
+--------------------------------------------------------
+    class ISpiDevice {
+    public:
+        virtual Status writeThenRead(const uint8_t* tx, size_t txLen, uint8_t* rx, size_t rxLen) = 0;
+        virtual Status writeThenWrite(const uint8_t* header, size_t headerLen,
+                                      const uint8_t* payload, size_t payloadLen) = 0;
+    protected:
+        ~ISpiDevice() = default;
+    };
+  - "virtual ... = 0" is a PURE virtual function: the class only describes
+    what can be done; a subclass must implement it.
+  - One call = one chip-select assertion. writeThenRead covers "command, then
+    read N bytes" (registers, flash read, JEDEC ID). writeThenWrite covers
+    "command/address, then data" (register write, flash page program).
+  - const uint8_t* tx: pointer to bytes the callee may READ but not change.
+    uint8_t* rx: pointer to the caller's buffer the callee FILLS.
+    The caller owns both buffers; they only need to live for the call.
+  - The protected non-virtual destructor: nobody deletes a bus through this
+    interface (no heap), and avoiding a virtual destructor stops the compiler
+    from generating a "deleting destructor" that would pull operator delete
+    into the image.
+Similar interfaces: II2cBus (write / writeThenRead with a 7-bit address),
+IByteWriter (UART transmit), IByteSource (read buffered UART bytes),
+IClock (millis(), delayMs()).
+
+F.5 HalSpiDevice - the STM32 implementation (Components/BSP/HalSpiDevice.cpp)
+------------------------------------------------------------------------------
+Compiled only if CubeMX enabled an SPI peripheral:
+    #if defined(HAL_SPI_MODULE_ENABLED)
+Today that macro is not defined, so the file compiles to nothing - no dummy
+handles were invented.
+    Status HalSpiDevice::writeThenRead(const uint8_t* tx, size_t txLen, uint8_t* rx, size_t rxLen)
+    {
+        if (hspi_ == nullptr || ... || txLen > UINT16_MAX || rxLen > UINT16_MAX) {
+            return Status::InvalidArgument;
+        }
+        if (!lock()) { return Status::Timeout; }
+        select();                                       // CS low
+        HAL_StatusTypeDef hs = HAL_OK;
+        if (txLen > 0u) {
+            hs = HAL_SPI_Transmit(hspi_, const_cast<uint8_t*>(tx), static_cast<uint16_t>(txLen), timeoutMs_);
+        }
+        if (hs == HAL_OK && rxLen > 0u) {
+            hs = HAL_SPI_Receive(hspi_, rx, static_cast<uint16_t>(rxLen), timeoutMs_);
+        }
+        deselect();                                     // CS high, ALWAYS
+        unlock();
+        return fromHal(hs);
+    }
+  - HAL_SPI_Transmit/Receive are BLOCKING ("polling") HAL calls: they return
+    when done or after timeoutMs. Return HAL_OK / HAL_ERROR / HAL_BUSY /
+    HAL_TIMEOUT, mapped to our Status by fromHal().
+  - HAL length parameters are uint16_t, hence the UINT16_MAX check.
+  - const_cast: HAL's prototype takes a non-const pointer even for transmit,
+    although it only reads. const_cast removes const for that call; it is safe
+    ONLY because HAL does not write to it.
+  - select()/deselect() call HAL_GPIO_WritePin(csPort_, csPin_, GPIO_PIN_RESET/SET).
+  - CS is released even if the transfer failed, otherwise the device would
+    stay selected and corrupt the next transfer.
+  - Optional busLock_ (a SoarOS Mutex*) serialises tasks sharing one bus.
+
+F.6 HalI2cBus (Components/BSP/HalI2cBus.cpp)
+---------------------------------------------
+HAL_I2C_MODULE_ENABLED is defined by CubeMX's default hal_conf even with no
+I2C instance, so this compiles (and is unused until wired).
+    if (txLen == 1u || txLen == 2u) {
+        const uint16_t memAddr = (txLen == 1u) ? tx[0] : static_cast<uint16_t>((tx[0] << 8) | tx[1]);
+        const uint16_t memSize = (txLen == 1u) ? I2C_MEMADD_SIZE_8BIT : I2C_MEMADD_SIZE_16BIT;
+        return fromHal(HAL_I2C_Mem_Read(hi2c_, addr8, memAddr, memSize, rx, ..., timeoutMs_));
+    }
+HAL_I2C_Mem_Read performs exactly "START, addr+W, register, REPEATED START,
+addr+R, data, STOP" - the sequence sensors require. Longer write parts fall
+back to transmit + STOP + receive (documented limitation).
+
+F.7 HalUartPort and the ring buffer
+-----------------------------------
+Receive path (compiled only with HAL_UART_MODULE_ENABLED):
+    void HalUartPort::arm()        { HAL_UART_Receive_IT(huart_, &rxByte_, 1u); }
+    void HalUartPort::onRxComplete() { rx_.push(rxByte_); arm(); }
+HAL_UART_Receive_IT starts an interrupt-driven receive of ONE byte. When it
+arrives, HAL calls the weak C function HAL_UART_RxCpltCallback(huart) in
+interrupt context; the code in main.c USER CODE 4 (to be added when a UART
+exists) forwards it to paraguardian_uart_rx_complete(), which finds the
+matching HalUartPort and pushes the byte into its ring buffer, then re-arms.
+The acquisition task later calls read() to drain the buffer.
+
+Components/Common/ByteRingBuffer.hpp - lock-free single-producer/
+single-consumer FIFO:
+    bool push(uint8_t byte) {
+        const uint32_t head = head_.load(std::memory_order_relaxed);
+        const uint32_t tail = tail_.load(std::memory_order_acquire);
+        if ((head - tail) >= N) { overflowCount_.fetch_add(1u, ...); return false; }
+        storage_[head & (N - 1u)] = byte;
+        head_.store(head + 1u, std::memory_order_release);
+        return true;
+    }
+  - head_ counts bytes ever written, tail_ bytes ever read. Both only grow and
+    wrap at 2^32. (head - tail) is the fill level even across the wrap,
+    because unsigned subtraction is modulo 2^32.
+  - N is a power of two, so "index % N" == "index & (N - 1)" (a cheap AND).
+    Example N = 8: index 13 = 0b1101, & 0b0111 = 0b0101 = 5.
+  - Only the ISR writes head_, only the task writes tail_, so no lock is
+    needed. release/acquire make sure the byte is stored BEFORE the new head_
+    becomes visible to the reader.
+  - Full -> the NEW byte is dropped and counted. The parsers then see a gap
+    and resynchronise (Part G.5/G.6).
+Tests: ring_buffer_fifo_order_and_wrap, ring_buffer_overflow_drops_newest_and_counts,
+ring_buffer_partial_pop.
+
+F.8 RtosClock (Components/BSP/RtosClock.cpp)
+--------------------------------------------
+    uint32_t RtosClock::millis() {
+        return static_cast<uint32_t>(xTaskGetTickCount()) * (1000u / configTICK_RATE_HZ);
+    }
+    void RtosClock::delayMs(uint32_t ms) {
+        if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
+            vTaskDelay(pdMS_TO_TICKS(ms) + 1u);
+        } else {
+            busyWaitMs(ms);
+        }
+    }
+  - Why "+ 1"? vTaskDelay(1) called just before a tick boundary may return
+    after only a few microseconds. Adding a tick guarantees AT LEAST ms.
+  - busyWaitMs() uses the Cortex-M7 DWT cycle counter:
+        CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;   // enable trace block
+        DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;              // start cycle counter
+        while ((DWT->CYCCNT - start) < cyclesPerMs) {}
+    "|=" sets a bit without changing the others. CYCCNT counts CPU cycles
+    (64 000 per ms at 64 MHz).
+  - Timeouts in drivers are written as  (clock_.millis() - start) >= timeout
+    which stays correct when millis() wraps from 4294967295 to 0.
+
+F.9 IRegisterBus - registers over SPI or I2C (Components/Common/RegisterBus.cpp)
+---------------------------------------------------------------------------------
+    Status SpiRegisterBus::readRegisters(uint8_t reg, uint8_t* dst, size_t len) {
+        if (dst == nullptr || len == 0u) return Status::InvalidArgument;
+        const uint8_t command = static_cast<uint8_t>((reg & protocol_.addressMask) | protocol_.readFlag);
+        return spi_.writeThenRead(&command, 1u, dst, len);
+    }
+Bit logic for reg = 0x0F with addressMask 0x7F, readFlag 0x80:
+      0x0F & 0x7F = 0000 1111   (make sure bit 7 is clear)
+      ...  | 0x80 = 1000 1111 = 0x8F
+For a write the flag is 0x00, so the command is just 0x0F.
+    Status I2cRegisterBus::readRegisters(uint8_t reg, uint8_t* dst, size_t len) {
+        return bus_.writeThenRead(address7_, &reg, 1u, dst, len);
+    }
+The driver above does not care which one it has.
+Lifetime: SpiRegisterBus stores "ISpiDevice& spi_" - a REFERENCE (an alias)
+to an object that must outlive it. In firmware both are static objects.
+
+
+===============================================================================
+PART G - SENSOR-BY-SENSOR DRIVER WALKTHROUGH
+===============================================================================
+
+-------------------------------------------------------------------------------
+G.1 Common pieces every driver uses
+-------------------------------------------------------------------------------
+pg::Status  (Components/Common/Status.hpp)
+    enum class Status : uint8_t { Ok = 0, BusError, Timeout, InvalidArgument,
+        WrongDeviceId, NotInitialized, NotReady, ChecksumError, BufferOverflow,
+        VerifyFailed, OutOfRange, Busy, Unsupported, InvalidData };
+    constexpr bool isOk(Status s) { return s == Status::Ok; }
+"enum class" means the names are scoped (Status::Ok) and do not convert to
+int silently. ": uint8_t" makes it one byte.
+
+Byte helpers (Components/Common/ByteOrder.hpp) - HOW BYTES BECOME NUMBERS
+    constexpr uint16_t le_u16(const uint8_t* p) {
+        return static_cast<uint16_t>(static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8));
+    }
+    constexpr int16_t le_i16(const uint8_t* p) { return static_cast<int16_t>(le_u16(p)); }
+Worked example - an accelerometer sends low byte 0x00, then high byte 0xF8:
+    p[1] << 8      = 0xF800
+    | p[0]         = 0xF800 | 0x00 = 0xF800   (unsigned value 63488)
+    as int16_t     = 63488 - 65536 = -2048
+Why? Two's complement: in 16 bits, if the top bit (bit 15) is 1 the number is
+negative, value = unsigned - 65536. 0x7FFF = +32767 is the largest, 0x8000 =
+-32768 the smallest, 0xFFFF = -1.
+24-bit signed (BMP585 temperature) has no native type, so we sign-extend:
+    uint32_t v = le_u24(p);                 // e.g. 0x00F5C000
+    if ((v & 0x00800000u) != 0u) {          // bit 23 set -> negative
+        v |= 0xFF000000u;                   // fill bits 24..31 with 1s -> 0xFFF5C000
+    }
+    return static_cast<int32_t>(v);         // -671744
+Tests: byteorder_signed16_extremes, byteorder_signed24_sign_extension,
+byteorder_32_and_writers.
+
+Standard samples (Components/Sensors/Common/SensorTypes.hpp)
+    struct SampleHeader { SensorId id; uint32_t timestampMs; uint32_t sequence; bool valid; };
+    struct ImuSample { SampleHeader header; Vec3f accel_mps2; Vec3f gyro_radps;
+                       float temperature_c; bool accelFresh, gyroFresh,
+                       accelSaturated, gyroSaturated; };
+    ... BaroSample, MagSample, GnssSample, LidarSample
+Rules: SI units in every float (m/s^2, rad/s, Pa, degC, uT, m, m/s); axes
+are the CHIP'S axes from its datasheet (board rotation comes later, once the
+PCB exists); sequence numbers reveal lost samples; valid=false means "do not
+use". GNSS latitude/longitude stay as int32 in 1e-7 degrees because a float
+(about 7 significant digits) would lose ~0.4 m of precision; toDegrees()
+converts to double when needed.
+    static_assert(std::is_trivially_copyable<ImuSample>::value, "...");
+proves at compile time that the struct can be memcpy'd into a FreeRTOS queue.
+
+SensorHealth (Components/Sensors/Common/SensorHealth.hpp)
+    void recordSuccess(uint32_t nowMs);     // successCount++, consecutiveFailures = 0
+    void recordFailure(Status s);           // failureCount++, consecutiveFailures++,
+                                            // and busError/timeout/invalidData counts
+    bool isHealthy(uint16_t maxConsecutiveFailures = 3u) const;
+Counters saturate at their maximum instead of wrapping to 0 (a wrapped
+counter would make a broken sensor look healthy). Every driver has a private
+track(Status) helper that records the result and returns it unchanged:
+    Status Lsm6dsrx::track(Status s) {
+        if (isOk(s)) health_.recordSuccess(clock_.millis()); else health_.recordFailure(s);
+        return s;
+    }
+so code can say  return track(s);  in one line.
+
+Why not SoarOS DataBroker? DataBroker knows only the rocket's types
+(IMUData, BaroData...); adding ours would require editing SoarOS, and each
+publish heap-allocates a copy for every subscriber (with a 15 KB heap and
+several hundred samples per second that is risky). Part G.7 shows our hub.
+
+-------------------------------------------------------------------------------
+G.2 LSM6DSRX - 6-axis IMU, three instances
+-------------------------------------------------------------------------------
+Files: Components/Sensors/LSM6DSRX/Lsm6dsrxRegisters.hpp, Lsm6dsrx.hpp, Lsm6dsrx.cpp
+Datasheet facts used (ST DS13633):
+    REG_WHO_AM_I = 0x0F  (always reads 0x6B)
+    REG_CTRL1_XL = 0x10  accel: ODR_XL[7:4] FS_XL[3:2]
+    REG_CTRL2_G  = 0x11  gyro:  ODR_G[7:4]  FS_G[3:2] FS_125[1] FS_4000[0]
+    REG_CTRL3_C  = 0x12  BOOT[7] BDU[6] ... IF_INC[2] ... SW_RESET[0]
+    REG_STATUS   = 0x1E  TDA[2] GDA[1] XLDA[0]
+    REG_OUT_TEMP_L = 0x20 .. 0x2D: TEMP(2) GYRO X,Y,Z(6) ACCEL X,Y,Z(6), little-endian int16
+
+Class: pg::Lsm6dsrx
+  Constructor  Lsm6dsrx(IRegisterBus& bus, IClock& clock, SensorId id = SensorId::Imu0)
+    Stores REFERENCES to the bus and clock (no copies, no ownership). Each of
+    the three IMUs gets its own bus object (own CS line or I2C address), so
+    the instances share nothing - test lsm6dsrx_three_instances_are_independent.
+
+  Status init(const Lsm6dsrxConfig& config)
+    Parameters: config - ODR and full-scale for accel and gyro
+                (defaults: 416 Hz, +-16 g, 416 Hz, 2000 dps).
+    Returns: Ok, WrongDeviceId, Timeout, VerifyFailed or a bus error.
+    Step 1 - identify:
+        uint8_t who = 0u;
+        Status s = readWhoAmI(who);
+        if (!isOk(s)) return track(s);
+        if (who != WHO_AM_I_VALUE) return track(Status::WrongDeviceId);
+      Nothing is written to an unidentified device (test checks writes are empty).
+    Step 2 - software reset and poll:
+        s = bus_.writeRegister(REG_CTRL3_C, CTRL3_SW_RESET);   // 0x01
+        const uint32_t start = clock_.millis();
+        for (;;) {
+            clock_.delayMs(1u);
+            uint8_t ctrl3 = 0u;
+            s = bus_.readRegister(REG_CTRL3_C, ctrl3);
+            if (!isOk(s)) return track(s);
+            if ((ctrl3 & CTRL3_SW_RESET) == 0u) break;          // bit cleared = done
+            if ((clock_.millis() - start) >= kResetTimeoutMs) return track(Status::Timeout);
+        }
+      "ctrl3 & 0x01" isolates bit 0. The loop is BOUNDED by kResetTimeoutMs
+      (50 ms) so a dead chip cannot hang the task.
+    Step 3 - configure:
+        const uint8_t ctrl3 = static_cast<uint8_t>(CTRL3_BDU | CTRL3_IF_INC);  // 0x40|0x04 = 0x44
+        const uint8_t ctrl1 = encodeCtrl1Xl(config.accelOdr, config.accelRange);
+        const uint8_t ctrl2 = encodeCtrl2G(config.gyroOdr, config.gyroRange);
+      BDU (Block Data Update): the chip will not overwrite the high byte of an
+      output while we are between reading its low and high bytes - otherwise
+      we could combine bytes from two different samples.
+      IF_INC: the register address auto-increments during a burst read.
+    Step 4 - verify by reading 0x10..0x12 back in one burst:
+        if (readBack[0] != ctrl1 || readBack[1] != ctrl2 || readBack[2] != ctrl3)
+            return track(Status::VerifyFailed);
+      Catches broken MOSI, wrong SPI mode, or a device that ignored a write.
+    Step 5 - precompute scale factors:
+        accelScale_mps2_per_lsb_ = accelSensitivity_mg_per_lsb(range) * 1e-3f * 9.80665f;
+        gyroScale_radps_per_lsb_ = gyroSensitivity_mdps_per_lsb(range) * 1e-3f * kDegToRad;
+
+  Register encoding (static uint8_t encodeCtrl1Xl / encodeCtrl2G)
+        return (static_cast<uint8_t>(odr) << 4) | (static_cast<uint8_t>(range) << 2);
+    416 Hz = 0b0110, +-16 g = 0b01:
+        0110 << 4 = 0110 0000 = 0x60
+        01   << 2 = 0000 0100 = 0x04
+        OR        = 0110 0100 = 0x64
+    NOTE the odd datasheet encoding of FS_XL: 00=2g, 01=16g, 10=4g, 11=8g.
+    The enum Lsm6dsrxAccelRange stores those exact codes.
+    Gyro: 2000 dps is FS_G=11 -> 0x60 | (0b11 << 2) = 0x6C; 125 dps sets bit
+    FS_125 (0x02); 4000 dps sets bit FS_4000 (0x01).
+    Test: lsm6dsrx_encoding_matches_datasheet_bitfields.
+
+  Sensitivities (datasheet "mechanical characteristics"):
+      accel: 2g 0.061, 4g 0.122, 8g 0.244, 16g 0.488  mg/LSB
+      gyro : 125 4.375, 250 8.75, 500 17.5, 1000 35, 2000 70, 4000 140 mdps/LSB
+      temp : 256 LSB per degC, raw 0 = 25 degC
+
+  Status readRaw(Lsm6dsrxRaw& raw)
+      reads STATUS, then 14 bytes from 0x20 in one burst; rejects all-0x00 or
+      all-0xFF data (a floating or shorted MISO line) with InvalidData:
+        for (uint8_t b : buf) { allZero = allZero && (b == 0x00u); allOnes = allOnes && (b == 0xFFu); }
+      then decodes:
+        raw.temperature = bytes::le_i16(&buf[0]);
+        for (int axis = 0; axis < 3; ++axis) {
+            raw.gyro[axis]  = bytes::le_i16(&buf[2 + 2 * axis]);
+            raw.accel[axis] = bytes::le_i16(&buf[8 + 2 * axis]);
+        }
+
+  Status read(ImuSample& out)  - the function the acquisition loop calls
+      out is passed by REFERENCE: the function writes into the caller's
+      struct; nothing is allocated.
+        out.accel_mps2 = {raw.accel[0] * accelScale_mps2_per_lsb_, ...};
+        out.temperature_c = rawToTemperatureC(raw.temperature);   // raw/256 + 25
+        out.accelFresh = (raw.status & STATUS_XLDA) != 0u;
+        out.accelSaturated = isSaturated(raw.accel[0]) || ...;    // == 32767 or -32768
+        out.header.sequence = ++sequence_;
+        out.header.valid = true;
+      Worked example (test lsm6dsrx_read_converts_to_si_units), +-16 g:
+        raw accel Z = 2048 -> 2048 * 0.488 mg = 999.424 mg = 0.999424 g
+                     -> * 9.80665 = 9.8010 m/s^2   (about 1 g: board lying flat)
+        raw gyro X = 1000 -> 1000 * 70 mdps = 70 dps -> * pi/180 = 1.2217 rad/s
+        raw temp = 512 -> 512/256 + 25 = 27 degC
+      If not initialised: returns NotInitialized, out.header.valid = false.
+
+  Timing: SW reset completes in tens of microseconds (we poll every 1 ms);
+  first valid data after configuring needs a few ODR periods. At 416 Hz ODR
+  and a 100 Hz loop, each read returns the newest sample (older ones are
+  overwritten, BDU keeps each one consistent).
+  Failure conditions: WrongDeviceId (wiring/CS/SPI mode/part absent), Timeout
+  (reset never completes), VerifyFailed (writes not taking effect),
+  BusError/Timeout from the HAL, InvalidData (floating bus).
+  Tests (12): encoding, init success, wrong ID (no writes), reset timeout
+  (bounded to 50-52 ms of fake time), bus error at 2nd transaction, verify
+  failure, conversion, negative temperature + status bits, saturation,
+  floating bus, three independent instances, operation over I2C.
+
+-------------------------------------------------------------------------------
+G.3 BMP585 - barometer, two instances
+-------------------------------------------------------------------------------
+Files: Components/Sensors/BMP585/Bmp585Registers.hpp, Bmp585.hpp, Bmp585.cpp
+Datasheet / Bosch BMP5 API facts:
+    CHIP_ID 0x01 = 0x51 (BMP585; 0x50 would be a BMP581 -> rejected)
+    STATUS 0x28: nvm_rdy bit1, nvm_err bit2      INT_STATUS 0x27: POR bit4
+    DSP_CONFIG 0x30, DSP_IIR 0x31, OSR_CONFIG 0x36, ODR_CONFIG 0x37, OSR_EFF 0x38
+    CMD 0x7E: write 0xB6 = soft reset, then wait 2 ms
+    TEMP 0x1D..0x1F (24-bit SIGNED, 1/65536 degC), PRESS 0x20..0x22 (24-bit unsigned, 1/64 Pa)
+The BMP585 compensates internally - unlike the BMP280 there are no
+calibration coefficients to read. That is why a BMP280/388 driver must not
+be reused here.
+
+  Status init(const Bmp585Config& config)
+    1. CMD = 0xB6, delayMs(2).
+    2. Read CHIP_ID twice. On SPI the first chip-select edge after reset
+       switches the BMP585 from I2C to SPI mode, so the first read is a dummy.
+    3. Power-up check (from the Bosch API): STATUS must show nvm_rdy=1 and
+       nvm_err=0; INT_STATUS must show POR (reset complete). Else NotReady.
+    4. ODR_CONFIG = standby (configuration must be written in standby).
+    5. DSP_CONFIG = 0x2C (filtered values go to the data registers),
+       DSP_IIR = (pressureIir << 3) | temperatureIir,
+       OSR_CONFIG = press_en | (osr_p << 3) | osr_t.
+    6. Read DSP_IIR and OSR_CONFIG back -> VerifyFailed on mismatch.
+    7. Read OSR_EFF: bit 7 "odr_is_valid" is 0 if the chosen oversampling
+       cannot finish within one ODR period -> VerifyFailed.
+    8. Enter the requested power mode (normal by default) and verify it.
+  Bit packing of ODR_CONFIG (encodeOdrConfig):
+        deep_dis(bit7) | odr(5 bits, 6..2) | pwr_mode(1..0)
+        50 Hz code 0x0F: 0x0F << 2 = 0011 1100 = 0x3C
+        0x80 | 0x3C | 0x01(normal) = 1011 1101 = 0xBD
+    (the "& 0x1F" keeps the ODR code to 5 bits so it cannot spill into bit 7).
+  Status read(BaroSample& out)
+        uint8_t buf[6];                         // one burst: T xlsb,lsb,msb, P xlsb,lsb,msb
+        const int32_t  rawT = bytes::le_i24(&buf[0]);
+        const uint32_t rawP = bytes::le_u24(&buf[3]);
+        if (rawP == 0u || rawP == 0xFFFFFFu) return track(rawP == 0u ? Status::NotReady : Status::InvalidData);
+        out.pressure_pa   = rawP / 64.0f;
+        out.temperature_c = rawT / 65536.0f;
+        out.pressureInRange = 30000 <= p <= 125000 Pa (sensor operating range)
+    Worked example (test bmp585_converts_pressure_and_temperature):
+        bytes 0x40 0xF3 0x62 -> 0x62F340 = 6484800 -> /64 = 101325.0 Pa
+        bytes 0x00 0x80 0x19 -> 0x198000 = 1671168 -> /65536 = 25.5 degC
+        bytes 0x00 0xC0 0xF5 -> 0xF5C000 -> sign-extended -671744 -> -10.25 degC
+    A pressure of 20 000 Pa returns OutOfRange and valid=false (the sample is
+    still published so the consumer can see the sensor is alive but wrong).
+  Status measureForced(BaroSample& out, uint32_t timeoutMs = 100u)
+    Writes power mode "forced"; the chip measures once and returns to standby
+    by itself; we poll ODR_CONFIG until mode == standby (bounded), then read.
+  Timing: soft reset 2 ms; measurement time depends on oversampling (the
+  chip itself reports invalid combinations via OSR_EFF).
+  Tests (10): register encodings, full init sequence order (reset first,
+  standby before config, normal last), BMP581 ID rejected, NVM error and
+  missing POR, invalid OSR/ODR, conversion, negative temperature, zero /
+  out-of-range pressure, forced mode incl. timeout, two independent instances.
+  VERIFY ON HARDWARE: CHIP_ID 0x51 (taken from the Bosch API constants).
+
+-------------------------------------------------------------------------------
+G.4 MMC5983MA - magnetometer
+-------------------------------------------------------------------------------
+Files: Components/Sensors/MMC5983MA/Mmc5983ma.hpp, Mmc5983ma.cpp
+Datasheet facts:
+    0x00..0x06  X0 X1 Y0 Y1 Z0 Z1 XYZ2 (18-bit output)     0x07 Tout
+    0x08 STATUS: Meas_M_Done bit0, Meas_T_Done bit1 (write 1 to clear)
+    0x09 CTRL0: TM_M bit0, TM_T bit1, SET bit3, RESET bit4, Auto_SR_en bit5
+    0x0A CTRL1: BW[1:0], SW_RST bit7    0x0B CTRL2: Cm_freq[2:0], Cmm_en bit3
+    0x2F PRODUCT_ID = 0x30
+IMPORTANT QUIRK: CTRL0..CTRL3 are WRITE-ONLY. Reading them returns 0. So the
+driver cannot verify its configuration by read-back, and every write to CTRL0
+replaces ALL its bits. The driver keeps a shadow, ctrl0Persistent_, holding
+the bits that must stay set (Auto_SR_en) and ORs it into every CTRL0 write:
+        bus_.writeRegister(REG_CTRL0, static_cast<uint8_t>(ctrl0Persistent_ | CTRL0_SET));
+
+18-bit decoding (static Mmc5983maRaw decode18Bit(const uint8_t regs[7]))
+    raw.x = (regs[0] << 10) | (regs[1] << 2) | ((regs[6] >> 6) & 0x3);
+    raw.y = (regs[2] << 10) | (regs[3] << 2) | ((regs[6] >> 4) & 0x3);
+    raw.z = (regs[4] << 10) | (regs[5] << 2) | ((regs[6] >> 2) & 0x3);
+  Bits 17..10 come from X0, bits 9..2 from X1, bits 1..0 from bits 7..6 of the
+  shared register XYZ2. ">> 6" moves bits 7..6 down to 1..0; "& 0x3" keeps
+  only those two bits.
+  Worked example (test mmc5983ma_decode_18bit_hand_computed):
+      x = 147456 = 0x24000 -> X0 = 147456 >> 10 = 144 = 0x90, X1 = 0x00, low 00
+      z = 131073 -> X0 = 0x80, X1 = 0x00, low bits 01 -> XYZ2 bits 3..2 = 01 -> 0x04
+  Conversion: the output is OFFSET BINARY: 131072 (= 2^17) means 0 field;
+  16384 counts per gauss; 1 gauss = 100 microtesla.
+      float signedCounts = (int32_t)counts - 131072;
+      return signedCounts / 16384.0f * 100.0f;      // uT
+      147456 -> +16384 counts -> +1 G -> +100 uT
+  Saturation: 0 or 262143 counts (outside +-8 G) -> saturated, valid=false.
+
+  Status init(const Mmc5983maConfig& config)
+    SW reset (CTRL1 = 0x80) + 10 ms; PRODUCT_ID must be 0x30; reject illegal
+    continuous-rate/bandwidth combinations (InvalidArgument); write bandwidth;
+    one SET pulse; write persistent CTRL0 bits; optional continuous mode.
+  Status measure(MagSample& out)  - on-demand measurement
+    triggerAndWait(CTRL0_TM_M, STATUS_MEAS_M_DONE, measurementTimeoutMs()):
+      1. write 1 to the done bit to clear an old flag,
+      2. write TM_M (+ persistent bits) to start,
+      3. poll STATUS until the done bit is set, bounded by a timeout derived
+         from the bandwidth (100 Hz BW = 8 ms measurement -> 18 ms timeout).
+    Then a 7-byte burst read, decode, convert.
+  Status measureOffsetCancelled(MagSample& out)  - SET/RESET
+    The magnetoresistive bridge has an offset that drifts with temperature.
+    After a SET pulse the output is  (+H + offset); after a RESET pulse it is
+    (-H + offset). Subtracting and halving removes the offset:
+        H = (M_set - M_reset) / 2
+    Code: SET, measure, RESET, measure, SET again; Auto_SR is temporarily
+    cleared during the sequence and then WRITTEN BACK to the chip.
+    (A unit test found that the first version restored only the shadow copy
+    and not the chip - see Part J.6.)
+  Status measureTemperature(float&): TM_T trigger, read Tout,
+    degC = -75 + 0.8 * raw  (raw 125 -> 25 degC). Uncalibrated.
+  Not implemented (out of scope): hard-/soft-iron calibration.
+  Tests (10): decoding (hand-computed), low-bit separation, init sequence,
+  wrong ID, invalid continuous config, conversion, measurement timeout,
+  saturation, SET/RESET offset removal (fake adds a large offset), temperature.
+
+-------------------------------------------------------------------------------
+G.5 NEO-M9N GNSS - UBX protocol
+-------------------------------------------------------------------------------
+Files: Components/Sensors/NEOM9N/UbxParser.hpp/.cpp, NeoM9n.hpp/.cpp
+The receiver (on the MIKROE-3922 board) streams bytes on UART. By default it
+sends NMEA text; we want the binary UBX protocol, specifically UBX-NAV-PVT
+("position, velocity, time"), 92 bytes of payload.
+
+UBX frame:
+    B5 62 | CLASS | ID | LEN_L LEN_H | PAYLOAD (LEN bytes) | CK_A CK_B
+Checksum (8-bit Fletcher) over CLASS..PAYLOAD:
+    for each byte b: CK_A = CK_A + b; CK_B = CK_B + CK_A;   (both mod 256)
+Worked example - the well-known u-blox frame "set rate 100 ms":
+    B5 62 06 08 06 00 64 00 01 00 01 00 7A 12
+    bytes summed: 06 08 06 00 64 00 01 00 01 00
+    CK_A running: 6,14,20,20,120,120,121,121,122,122 -> 122 = 0x7A
+    CK_B running: 6,20,40,60,180,300,421,542,664,786 -> 786 mod 256 = 18 = 0x12
+Test ubx_checksum_matches_published_frames uses this frame and the MON-VER
+poll frame B5 62 0A 04 00 00 0E 34 as independent references.
+
+Parser state machine (ubx::Parser::feed(uint8_t byte, uint32_t nowMs, Frame& out))
+    Sync1 --B5--> Sync2 --62--> Class -> Id -> LenLow -> LenHigh
+          -> Payload (LEN bytes) -> CkA -> CkB -> (verify) -> Sync1
+  - Bytes that are not B5 in Sync1 (NMEA text, noise) are counted as
+    discardedBytes and ignored.
+  - In Sync2, another B5 keeps waiting for 62 (handles "B5 B5 62").
+  - Length > MAX_PAYLOAD (256): oversize_ = true -> payload bytes are counted
+    and checksummed but NOT stored, so the buffer can never overflow:
+        if (!oversize_) { payload_[index_] = byte; }   // index_ < length_ <= 256
+  - Checksum mismatch -> checksumErrors++ and back to Sync1; the next frame
+    is found normally.
+  - checkTimeout(nowMs, 100): if a frame is half-received and no byte arrived
+    for 100 ms, abandon it (the UART lost bytes).
+  - The returned Frame.payload POINTS INTO the parser's buffer. It is only
+    valid until the next feed() - a classic pointer-lifetime rule. NeoM9n
+    decodes it immediately.
+
+NAV-PVT decoding (ubx::decodeNavPvt) - byte offsets from the u-blox M9
+interface description, e.g.:
+    out.lat_1e7deg = bytes::le_i32(p + 28);   // degrees * 1e7
+    out.hMSL_mm    = bytes::le_i32(p + 36);   // height above mean sea level, mm
+    out.velD_mmps  = bytes::le_i32(p + 56);   // velocity DOWN, mm/s
+    out.flags      = p[21];                   // bit0 gnssFixOK
+    out.flags3     = bytes::le_u16(p + 78);   // bit0 invalidLlh
+Conversion (ubx::navPvtToSample):
+    out.heightMsl_m = hMSL_mm * 1e-3f;
+    out.verticalVelocity_mps = -velD_mmps * 1e-3f;   // NED "down" -> "up" positive
+Validity rules (do not trust what the receiver itself does not trust):
+    positionValid = gnssFixOK && (fix 2D/3D/GNSS+DR) && !invalidLlh
+    heightValid   = gnssFixOK && (fix 3D or GNSS+DR) && !invalidLlh
+Test nav_pvt_decoded_to_si_units uses Calgary-like coordinates
+51.0447331 N, -114.0718831 E, 1045.123 m, climbing 1.5 m/s (velD = -1500).
+
+NeoM9n class
+  size_t processBytes(const uint8_t* data, size_t len, uint32_t nowMs)
+      feeds every byte; each valid NAV-PVT updates latest(); returns the
+      number of new solutions; checksum errors are added to health.
+  void poll(uint32_t nowMs)
+      parser timeout + STALE detection: no NAV-PVT for 2 s -> latest() is
+      marked invalid (old position must not be used as current).
+  static size_t buildEnableNavPvtFrame(uint16_t periodMs, bool disableNmea, uint8_t* dst, size_t cap)
+      builds a UBX-CFG-VALSET frame (class 0x06, id 0x8A) setting:
+        CFG-UART1OUTPROT-UBX = 1, CFG-UART1OUTPROT-NMEA = 0/1,
+        CFG-MSGOUT-UBX_NAV_PVT_UART1 = 1, CFG-RATE-MEAS = periodMs
+      Each configuration key encodes its value size in bits 28..30
+      (keyValueSize: 1 = one bit sent as a byte, 2 = 1 byte, 3 = 2 bytes,
+      4 = 4 bytes). Rejects periods < 40 ms (NEO-M9N max 25 Hz).
+      The receiver answers ACK-ACK (05 01) or ACK-NAK (05 00):
+      lastConfigAck() reports it.
+  VERIFY ON HARDWARE: the four key IDs and default baud (38400).
+  Not assumed: fix quality or accuracy - hAcc/vAcc are reported as the
+  receiver states them.
+  Tests (16): published checksums, frame building, NMEA skipping, corrupt
+  checksum recovery, partial-frame timeout, truncated-frame recovery,
+  oversize frame (1000-byte payload) without overflow, zero-length frame,
+  NAV-PVT conversion, validity rules (2D, !gnssFixOK, invalidLlh, time-only),
+  wrong length, stale timeout, checksum errors in health, VALSET exact bytes
+  (checksum 0x53 0x48 computed independently), VALSET sizes/round-trip,
+  ACK/NAK.
+
+-------------------------------------------------------------------------------
+G.6 TF02-Pro LiDAR
+-------------------------------------------------------------------------------
+Files: Components/Sensors/TF02Pro/Tf02Pro.hpp, Tf02Pro.cpp
+Frame (9 bytes, 100 Hz, 115200 baud by default):
+    59 59 Dist_L Dist_H Strength_L Strength_H Temp_L Temp_H Checksum
+    checksum = low 8 bits of (byte0 + ... + byte7)
+Worked example (test tf02_valid_frame_decoded):
+    59 59 D2 04 E8 03 C8 08 43
+    distance = 0x04D2 = 1234 cm = 12.34 m
+    strength = 0x03E8 = 1000
+    temp raw = 0x08C8 = 2248 -> 2248/8 - 256 = 25 degC
+    sum = 0x59+0x59+0xD2+0x04+0xE8+0x03+0xC8+0x08 = 835 = 0x343 -> low byte 0x43
+Parser (tf02::Parser::feed):
+  - hunts for 59 59; collects 9 bytes; checks the sum;
+  - SMART RESYNC on a bad checksum (resyncAfterBadFrame): a real frame may
+    start INSIDE the 9 bad bytes, so it searches positions 1..8 for "59 59"
+    and keeps the bytes from there instead of throwing them away:
+        window [59 59 12 | 59 59 D2 04 E8 03]  -> keep [59 59 D2 04 E8 03]
+    Test tf02_resync_inside_corrupted_window proves the following valid frame
+    is not lost.
+Validity (Tf02Pro::frameToSample):
+    weakSignal = strength < 60 || strength == 65535   (manual: unreliable / over-exposed)
+    outOfRange = distance_m > maxRange_m (40 m default; catches the
+                 out-of-range sentinel value too)
+    header.valid = !weakSignal && !outOfRange
+Weak readings are expected (pointing at sky/water) and are counted as
+OutOfRange in health, not as bus faults.
+poll(): no frame for 100 ms -> latest invalid (stale).
+This driver gives distance only - no landing guidance (out of scope).
+Tests (10): decode, mm unit, bad checksum, garbage before frame, resync
+inside a corrupted window, frame split across reads, weak/over-exposed
+threshold (59 invalid, 60 valid), out of range, stale timeout, ten frames in
+one buffer.
+
+-------------------------------------------------------------------------------
+G.7 From driver to RTOS: the acquisition layer
+-------------------------------------------------------------------------------
+Files: Components/Acquisition/*
+SensorMessage - a "tagged union":
+    struct SensorMessage {
+        SensorMessageType type;              // which member is valid
+        union { ImuSample imu; BaroSample baro; MagSample mag; GnssSample gnss; LidarSample lidar; };
+    };
+A union stores all members in the SAME memory; its size is the largest
+member. A FreeRTOS queue needs one fixed item size, which this gives us.
+The "type" field tells the reader which member to look at.
+
+ISampleQueue / BoundedSampleQueue<N> / RtosSampleQueue<N>
+    tryPush() NEVER blocks: full -> return false.
+
+SensorDataHub (publish/subscribe, max 4 subscribers)
+    void SensorDataHub::publish(const SensorMessage& msg) {
+        ++published_;
+        for (size_t i = 0; i < count_; ++i) {
+            if (!subs_[i].queue->tryPush(msg)) ++subs_[i].drops;
+        }
+    }
+Overflow policy: DROP NEWEST per subscriber and count it. A slow consumer
+loses data but never stalls sampling or the other consumers.
+Test hub_drop_newest_per_subscriber: capacities 2 and 8, five messages ->
+3 drops on the small queue, 0 on the big one, oldest messages kept.
+
+IAcquisitionSource + adapters (ImuSource, BaroSource, MagSource,
+GnssSource, LidarSource) - PolledSourceBase::service():
+    if (!driverInitialized()) {
+        if (attempted_ && (nowMs - lastAttemptMs_) < retryIntervalMs_) return;
+        attempted_ = true; lastAttemptMs_ = nowMs;
+        lastInitStatus_ = begin();                    // driver.init(config)
+        if (!isOk(lastInitStatus_)) { ++initFailures_; return; }
+        scheduled_ = false;
+    }
+    if (!scheduled_) { scheduled_ = true; nextDueMs_ = nowMs; }
+    if (static_cast<int32_t>(nowMs - nextDueMs_) < 0) return;   // not due yet
+    nextDueMs_ += periodMs_;
+    if (static_cast<int32_t>(nowMs - nextDueMs_) >= 0) nextDueMs_ = nowMs + periodMs_;  // no bursts
+    readAndPublish(sink);
+  - A sensor that fails init is retried every second (e.g. loose connector
+    on the bench) - test imu_source_retries_init_at_interval.
+  - Each source has its own period (e.g. IMU 10 ms, baro 20 ms) even though
+    the loop runs every 10 ms - test polled_source_respects_its_own_period.
+  - "(int32_t)(now - due) < 0" is the wrap-safe way to ask "is now before
+    due?".
+  - After a long stall it does not fire 50 catch-up reads in a row - test
+    polled_source_does_not_burst_after_stall.
+  - GnssSource/LidarSource drain at most 8 x 64 bytes per cycle so a burst
+    cannot starve the other sensors; LiDAR publishes only the newest frame
+    per cycle.
+
+
+===============================================================================
+PART H - EXTERNAL FLASH AND BLUETOOTH
+===============================================================================
+
+-------------------------------------------------------------------------------
+H.1 W25Q128JV - 16 MiB SPI NOR flash
+-------------------------------------------------------------------------------
+Files: Components/Storage/W25Q128/W25q128.hpp, W25q128.cpp
+Geometry (Winbond datasheet): 16 777 216 bytes = 65 536 pages x 256 B
+                                               = 4 096 sectors x 4 KiB
+                                               = 256 blocks x 64 KiB
+NOR flash rules:
+  - Erasing sets bytes to 0xFF. Programming can only change bits 1 -> 0.
+    (So writing 0xAA over 0x00 leaves 0x00. Test w25q_verify_detects_unerased_area.)
+  - Smallest erase = one 4 KiB sector.
+  - Page Program (02h) writes at most 256 bytes and, if you run past the END
+    of a 256-byte page, the chip WRAPS AROUND to the START OF THE SAME PAGE
+    and silently overwrites it. This is the most common flash-driver bug.
+  - Every program/erase must be preceded by Write Enable (06h), which sets the
+    WEL bit; the chip clears WEL when the operation ends.
+  - During program/erase the BUSY bit (status register 1, bit 0) is 1.
+Instructions used: 9F JEDEC ID, 05 read status 1, 06 write enable, 03 read
+data, 02 page program, 20 sector erase, D8 64 KiB block erase, AB release
+from power-down.
+
+  Status init()
+      AB (wake), wait >= 3 us (we wait 1 ms), read JEDEC ID, require
+      EF (Winbond) 40 or 70 (memory type: -IQ/JQ vs -IM/JM) 18 (128 Mbit),
+      wait until not busy (an MCU reset may have interrupted an erase).
+      NEVER erases anything (test w25q_init_reads_jedec_and_never_erases
+      checks that 20h/D8h/C7h/60h were never sent).
+  Status read(uint32_t address, uint8_t* dst, size_t len)
+      uint8_t header[4] = {CMD_READ_DATA, 0, 0, 0};
+      bytes::put_be_u24(&header[1], address);     // 24-bit address, MSB first
+      return spi_.writeThenRead(header, 4, dst, len);
+      Address 0x123456 -> bytes 03 12 34 56 (test w25q_read_command_bytes_big_endian_address).
+  Bounds checking without overflow:
+      static bool rangeIsValid(uint32_t address, size_t len) {
+          return address < CAPACITY_BYTES && len <= (CAPACITY_BYTES - address);
+      }
+      The naive "address + len <= CAPACITY" can overflow: 0xFFFFFFFF + 2 wraps
+      to 1 and would PASS. Subtracting first cannot overflow because we
+      already know address < CAPACITY.
+  Status pageProgram(uint32_t address, const uint8_t* src, size_t len)
+      const uint32_t offsetInPage = address % PAGE_SIZE;       // 0..255
+      if (offsetInPage + len > PAGE_SIZE) return Status::InvalidArgument;
+      writeEnable() -> 02 + address + data -> waitUntilReady(5 ms)
+      Example: address 0xF0, 32 bytes: 0xF0 % 256 = 240, 240 + 32 = 272 > 256
+      -> rejected instead of corrupting bytes 0x00..0x0F.
+  Status write(uint32_t address, const uint8_t* src, size_t len, bool verify)
+      splits at page boundaries:
+          const size_t roomInPage = PAGE_SIZE - (addr % PAGE_SIZE);
+          const size_t chunk = min(len - done, roomInPage);
+      0xF0 + 32 bytes -> 16 bytes at 0xF0, then 16 bytes at 0x100.
+      1000 bytes at 0x1234 -> 204, 256, 256, 256, 28 (test checks all five).
+      verify=true reads each page back into a 256-byte stack buffer and
+      compares -> VerifyFailed on mismatch.
+  Status writeEnable()
+      sends 06, then reads status and REQUIRES WEL=1. If the chip is
+      write-protected (or busy) WEL stays 0 and we return VerifyFailed
+      instead of "succeeding" with nothing written.
+  Status eraseSector(uint32_t address)  (must be 4096-aligned, else InvalidArgument)
+  Status waitUntilReady(uint32_t timeoutMs)  bounded BUSY polling.
+  Timeouts (datasheet maxima + margin): page 5 ms (tPP max 3 ms), sector
+  500 ms (tSE max 400 ms), 64 KiB block 2500 ms (max 2000 ms).
+  No filesystem (out of scope).
+  Fake used in tests (Tests/mocks/FakeW25q.hpp) models: WEL, BUSY for a few
+  status reads, NOR AND-programming, IN-PAGE WRAP, erase, write protect,
+  stuck busy, bus error. 12 tests.
+
+-------------------------------------------------------------------------------
+H.2 CYW20822 Bluetooth with EZ-Serial - what is and is NOT implemented
+-------------------------------------------------------------------------------
+Files: Components/Communications/Bluetooth/EzSerialLink.hpp/.cpp, SosMessage.hpp/.cpp
+Honesty first: the EZ-Serial command reference for the exact CYW20822
+firmware has NOT been verified. Inventing command strings for a safety device
+is unacceptable, so the code contains NO command names, NO event names, NO
+result codes and NO binary-mode packets.
+Implemented (protocol-agnostic):
+  - Line framing: text mode exchanges ASCII lines ending in CR LF.
+        if (c == '\n') { line_[lineLen_] = '\0'; handleLine(nowMs); lineLen_ = 0; }
+        if (c == '\r' || discardingLine_) continue;
+        if (lineLen_ >= ezs::MAX_LINE) { ++stats_.overlongLines; discardingLine_ = true; ... }
+        line_[lineLen_++] = c;
+    The buffer is char line_[MAX_LINE + 1] (160 + NUL). A line that is too
+    long is DISCARDED up to its newline - never written past the buffer.
+  - Classification: "@R," = response, "@E," = event, anything else "Other".
+    (This "@R/@E" shape is the EZ-Serial text format documented for earlier
+    Infineon modules; it is marked TO BE VERIFIED for CYW20822.)
+  - parseLine() splits fields in place: each ',' becomes '\0' and a pointer
+    to the next field is stored. The pointers point INTO line_, so they are
+    valid only during the onPacket() callback - another lifetime rule.
+  - sendCommand(const char* text, uint32_t nowMs): the APPLICATION supplies
+    the text; we check it is printable ASCII, <= 128 chars, append CR LF,
+    allow ONE outstanding command (Busy otherwise), and start a response
+    timeout. poll(now) turns a missing response into responseTimeouts++;
+    3 in a row -> state Fault.
+  - IEzSerialListener::onPacket(const ezs::Packet&) callback: the application
+    interprets events and may call setState(Connected/Disconnected).
+SOS interface (SosMessage.hpp):
+    enum class SosTransmitState { Idle, Queued, HandedToModule, ModuleRejected, TransportUnavailable };
+  There is deliberately no "Delivered" state - the firmware cannot know
+  whether a phone received it or anyone was alerted.
+  formatSosRecord() makes a bounded ASCII record without printf or heap:
+      "SOS,2,1,510447331,-1140718831,10451,3700,123"
+  It writes through a small Writer class that checks capacity on EVERY
+  character and returns 0 if the text did not fit (buffer still
+  NUL-terminated). Negative numbers are converted safely even for INT32_MIN:
+      uint64_t mag = negative ? static_cast<uint64_t>(-(v + 1)) + 1u : v;
+  (-(v+1)+1 avoids overflowing when negating the most negative value.)
+Tests (9): framing, invalid commands, classification, field split, line split
+across reads, overlong line, timeout -> Fault -> recovery, SOS format,
+extreme values / tiny buffer.
+
+-------------------------------------------------------------------------------
+H.3 Audio, LEDs, power - interfaces only
+-------------------------------------------------------------------------------
+Components/Output/Audio/IAudioAlert.hpp - AlertTone, AlertPriority,
+  AlertRequest; request()/cancel()/isPlaying(). The MAX98357A is an I2S/SAI
+  amplifier: the MCU must stream PCM samples (normally via DMA). Which SAI,
+  which pins, sample rate - all schematic-dependent, so not implemented.
+Components/Output/LED/IStatusLed.hpp - LedPattern (SlowBlink, FastBlink,
+  SosBlink...), setPattern(), tick(nowMs).
+Components/Power/IPowerMonitor.hpp - PowerStatus, sample(), and a pure
+  helper classifyBattery(mV, lowMv, criticalMv): thresholds are supplied by
+  the caller because the battery chemistry is not chosen yet.
+
+
+===============================================================================
+PART I - ERROR HANDLING, MEMORY AND CONCURRENCY
+===============================================================================
+
+I.1 Three kinds of "something went wrong"
+-----------------------------------------
+  1. Programming errors (a bug): e.g. creating a task twice, kernel not
+     initialised. -> SOAR_ASSERT. With DISABLE_DEBUG it calls
+     HAL_NVIC_SystemReset(). Used ONLY at start-up.
+  2. Runtime faults (the world misbehaves): sensor absent, NACK, timeout,
+     checksum error. -> return a pg::Status, record it in SensorHealth,
+     carry on, retry later. A paraglider safety device must keep running
+     with the sensors that still work.
+  3. Implausible data: -> deliver the sample with header.valid = false or
+     specific flags (saturated, weakSignal, outOfRange, !positionValid).
+Exceptions are disabled (-fno-exceptions): no try/catch anywhere.
+
+I.2 How failures propagate (example)
+------------------------------------
+  HAL_SPI_Receive returns HAL_TIMEOUT
+   -> HalSpiDevice::fromHal -> Status::Timeout
+   -> SpiRegisterBus::readRegisters returns it
+   -> Lsm6dsrx::readRaw returns it, Lsm6dsrx::read calls track(s):
+        health_.timeoutCount++, consecutiveFailures++
+   -> ImuSource::readAndPublish publishes nothing
+   -> HealthMonitorTask copies the counters to g_systemHealth.sources[i]
+Every layer either handles the error or returns it upward; none ignores it.
+init() failures propagate to PolledSourceBase, which counts initFailures and
+retries.
+
+I.3 Memory: where everything lives
+----------------------------------
+  Flash (.text/.rodata): code, constant tables.
+  .bss (RAM_D1, zeroed at reset): task stacks and TCBs (static members of the
+      singleton tasks), sample queues (RtosSampleQueue storage), ring
+      buffers, g_systemHealth, driver objects once BoardConfig creates them.
+  FreeRTOS heap (15 360 B inside .bss): SoarOS mutex, Health command queue,
+      defaultTask (until it exits).
+  Task stacks: local variables inside functions (e.g. the 14-byte buffer in
+      Lsm6dsrx::readRaw, the 256-byte verify buffer in W25q128::write).
+  Nothing calls new/malloc in the sampling path. All buffers have a fixed,
+  compile-time size.
+
+I.4 Pointers, references and lifetime (rules used throughout)
+-------------------------------------------------------------
+  - Drivers hold REFERENCES (IRegisterBus& bus_) to objects they do not own.
+    A reference cannot be null and cannot be re-seated. The referenced object
+    must outlive the driver -> in firmware everything is static.
+  - Output parameters are references (ImuSample& out): the caller owns the
+    struct, the driver fills it.
+  - Input buffers are const pointers + lengths (const uint8_t* data, size_t len);
+    every function checks for nullptr / zero length before use.
+  - "View" pointers (ubx::Frame::payload, ezs::Packet::fields) point into a
+    parser's internal buffer and are valid only until the next feed() / the
+    end of the callback. Copy what you need.
+
+I.5 Bounded buffers - the complete list
+---------------------------------------
+  ByteRingBuffer<512> per UART     full -> drop newest byte, overflowCount++
+  ubx payload 256 bytes            longer frame -> skipped, oversizeFrames++
+  TF02 window 9 bytes              fixed
+  EZ-Serial line 160 chars         longer -> discarded, overlongLines++
+  EZ-Serial command 128 chars      longer -> InvalidArgument
+  SensorDataHub 4 subscribers      5th -> subscribe() returns false
+  RtosSampleQueue<32>              full -> drop newest, per-subscriber drops++
+  Acquisition sources: 10          11th -> registerSource() returns false
+  GNSS/LiDAR drain: 512 B/cycle    rest stays in the ring buffer
+Each limit has a test.
+
+I.6 Concurrency map
+-------------------
+  Data                       Writer               Reader          Protection
+  -------------------------  -------------------  --------------  ------------------------
+  UART ring buffer           UART ISR             SensorAcq       lock-free SPSC atomics
+  driver objects             SensorAcq only       SensorAcq       single owner, no lock
+  SensorDataHub queues       SensorAcq            consumer task   FreeRTOS queue
+  acquisition stats_         SensorAcq            Health          aligned 32-bit words
+  SensorHealth counters      SensorAcq            Health          aligned words (diagnostic)
+  g_systemHealth             Health               debugger        none needed
+  SPI bus (future sharing)   any task             -               optional SoarOS Mutex
+Rule: each driver object is used by exactly one task. If a second task ever
+needs the flash (e.g. a logging task), give it its own SPI device object and
+share the bus via the Mutex in HalSpiDevice, or route requests through one
+owner task.
+
+I.7 Timing and non-blocking
+---------------------------
+  - Every wait loop is bounded by a timeout (reset, measurement, BUSY,
+    forced mode, response).
+  - Queue sends from the sampler use 0 ticks.
+  - Blocking SPI with a few-byte transfer takes microseconds; DMA is the
+    upgrade path if the measured cycle time (maxCycleTimeMs) gets close to
+    the 10 ms period.
+  - xTaskDelayUntil keeps the loop at a fixed rate and detects overruns.
+
+
+===============================================================================
+PART J - TESTING AND MOCKING
+===============================================================================
+
+J.1 Why host tests?
+-------------------
+No PCB, no sensors. But most driver logic (register sequences, bit packing,
+unit conversion, parsing, error handling) does not need real silicon: it
+needs something that BEHAVES like the chip. Running on the laptop is fast
+(98 tests in about a second), repeatable, and works with sanitizers.
+
+J.2 How to run
+--------------
+  sh Tests/run_host_tests.sh
+It compiles the portable sources + tests with:
+  -std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Wshadow -Werror
+  -fsanitize=address,undefined
+AddressSanitizer catches out-of-bounds accesses and use-after-free;
+UndefinedBehaviorSanitizer catches signed overflow, bad shifts, misaligned
+loads. -Werror turns every warning into a failure. It is a shell script, not
+a build system for the firmware; Tests/ is not part of the CubeIDE build.
+Last result: "98 tests, 98 passed, 0 failed" (Apple clang 17).
+
+J.3 The tiny framework (Tests/TestFramework.hpp)
+------------------------------------------------
+  TEST(name) { ... }        registers a function before main() runs (a static
+                            Registrar object's constructor adds it to a list)
+  CHECK(cond)               on failure prints file:line and returns from the test
+  CHECK_EQ(a, b)            prints both values
+  CHECK_NEAR(a, b, tol)     for floats
+
+J.4 The fakes ("mocks")
+-----------------------
+  MockClock          time moves only when the code calls delayMs(); a 50 ms
+                     timeout test takes microseconds. Tests can also check
+                     HOW LONG the driver chose to wait (totalDelayMs).
+  FakeRegisterDevice 128 registers + an SPI front-end that REJECTS a wrong
+                     read/write bit, + I2C front-end that NACKs a wrong address.
+                     Logs every write in order; hooks emulate chip behaviour:
+        dev.onWrite = [this, resetReads](uint8_t reg, uint8_t value) {
+            if (reg == 0x12 && (value & 0x01)) resetReadsRemaining = resetReads;
+        };
+                     (a lambda: an unnamed function object that "captures"
+                     variables in [...] - here "this" and resetReads - so the
+                     fake can make SW_RESET clear itself after N reads.)
+                     Fault injection: failAtTransaction = N, floatingBus = true.
+  FakeW25q           behavioural flash model (Part H.1).
+  FakeByteSource/FakeByteWriter   UART stand-ins.
+
+J.5 Expected values must be independent
+---------------------------------------
+A test that recomputes the answer with the same formula as the code proves
+nothing. Our expected values come from:
+  - the datasheet + hand arithmetic written in the test comment, e.g.
+      // accel Z 2048 -> 2048 * 0.488 mg = 0.999424 g = 9.8010014 m/s^2
+  - published external frames (u-blox CFG-RATE and MON-VER examples),
+  - checksums computed separately in Python before writing the tests,
+  - encoded bytes built by hand (e.g. MMC5983MA 0x90 0x00 ... 0x04).
+
+J.6 The tests found real problems
+---------------------------------
+First run: 96/98.
+  - mmc5983ma_set_reset_removes_offset failed: the driver restored the
+    Auto_SR_en bit in its shadow copy but never wrote it back to the chip
+    (CTRL0 is write-only). A real driver bug, now fixed in
+    Mmc5983ma::measureOffsetCancelled().
+  - w25q_sector_erase_alignment_and_effect failed because the TEST prepared
+    only 8 KiB but checked byte 0x2000 - a test bug, fixed.
+Lesson: a failing test is information; always find out whether the code or
+the test is wrong.
+
+J.7 What host tests cannot prove
+--------------------------------
+Electrical behaviour, SPI modes, real timing, real noise, interrupt latency,
+DMA/cache effects, the RTOS start-up on the chip, task stack usage on the
+target. Those need hardware (Part K). SENSOR_DRIVER_TEST_REPORT.md keeps the
+categories IMPLEMENTED / COMPILED / MOCK TESTED / HARDWARE VERIFIED separate;
+nothing is HARDWARE VERIFIED.
+
+
+===============================================================================
+PART K - HARDWARE BRING-UP
+===============================================================================
+Full checklist: Docs/HARDWARE_INTEGRATION_TODO.md. Summary:
+
+K.1 Before the board arrives
+  - Pick SPI/I2C/UART instances and pins from the schematic; enable them in
+    CubeMX; CS pins as outputs with initial level HIGH.
+  - Enable FreeRTOS stack-overflow checking (Option 2) and the malloc-failed
+    hook; forward them to paraguardian_on_stack_overflow/_on_malloc_failed.
+  - Regenerate, then re-check .cproject C++ settings and main.c USER CODE.
+  - Fill in Components/BSP/BoardConfig.cpp (template inside #if 0).
+
+K.2 First power-up
+  - Current-limited supply; check rails.
+  - Connect ST-LINK via SWD (PA13/PA14). Debug: breakpoint in
+    paraguardian_create_tasks(), then in SensorAcquisitionTask::Run().
+  - Live Expressions: pg::g_systemHealth - reportCount should increase once
+    per second; acquisitionCycles ~100 per second; missedDeadlines 0.
+
+K.3 One device at a time
+  identity -> init Ok -> static plausibility -> dynamic check -> rate check.
+  IMU at rest: |accel| ~ 9.81 m/s^2, gyro ~ 0.
+  Barometer: local pressure (Calgary ~ 88-90 kPa), temperature ~ room.
+  Magnetometer: |B| ~ 50-60 uT; rotate -> vector rotates.
+  GNSS: NMEA visible as discardedBytes; send VALSET; ACK; NAV-PVT outdoors.
+  LiDAR: compare to a tape measure.
+  Flash: erase ONE test sector, write across a page boundary, verify, power
+  cycle, read again.
+  Use a logic analyser on SPI first: CS low only during transfers, correct
+  clock polarity/phase, SCK below the chip's limit.
+
+K.4 Interpreting failures
+  WrongDeviceId  -> wiring, CS, SPI mode, MISO pull, wrong part
+  VerifyFailed   -> MOSI path, device ignoring writes, write protection
+  Timeout        -> chip not finishing (power, reset pin), bus stuck
+  InvalidData    -> floating/shorted MISO (all 0xFF or 0x00)
+  ChecksumError  -> baud rate, noise, wrong UART settings
+
+
+===============================================================================
+PART L - RECOMMENDED LEARNING EXERCISES
+===============================================================================
+Do these in order; each builds on the previous. Ask your tutor (or ChatGPT)
+to quiz you after each.
+
+ L1  Two's complement: by hand, decode {0x34, 0x12}, {0x00, 0x80},
+     {0xFF, 0xFF} as int16, and {0x00,0x00,0x80} as int24. Check against
+     test_common.cpp.
+ L2  Bit fields: compute CTRL1_XL for 104 Hz / +-4 g and CTRL2_G for
+     833 Hz / 500 dps. Add CHECK_EQ lines to
+     lsm6dsrx_encoding_matches_datasheet_bitfields and run the tests.
+ L3  Scaling: what acceleration does raw -16384 give at +-8 g? Write a test.
+ L4  Break something on purpose: change STATUS_XLDA to (1u << 1) in
+     Lsm6dsrxRegisters.hpp. Which tests fail and why? Revert.
+ L5  Add a new failure test: make FakeRegisterDevice fail the 14-byte burst
+     read in Lsm6dsrx::read and assert Status::BusError and health counts.
+ L6  UBX: build a NAV-PVT frame with fixType 2 and check heightValid; then
+     compute its checksum by hand for a 2-byte payload frame.
+ L7  TF02: create a stream where TWO frames are corrupted back to back and
+     check how many valid frames survive. Explain resyncAfterBadFrame().
+ L8  Flash: explain in words why pageProgram(0xF0, data, 32) is rejected.
+     Then extend FakeW25q to model chip erase (C7h) and write a test that
+     init() never sends it (already true - prove it).
+ L9  RTOS: draw a timeline of SensorAcq (prio 40) and Health (prio 16) over
+     30 ms, including what happens when Health is collecting and SensorAcq
+     wakes up.
+ L10 RTOS units: rewrite ACQUISITION_STACK_WORDS as bytes; explain what would
+     happen if you passed 4096 to xTaskCreateStatic.
+ L11 CMSIS: read osKernelStart() in cmsis_os2.c and explain why the SoarOS
+     V1 "#if 0" recipe would never start the scheduler under V2.
+ L12 Write an ISampleQueue consumer task skeleton (do not wire it yet):
+     subscribe an RtosSampleQueue<32> to SensorAcquisitionTask::hub() before
+     the scheduler starts, and in its loop call popWait() and switch on
+     msg.type.
+ L13 Design review prep: explain the "journey of one IMU sample" (appendix)
+     out loud in under 3 minutes, without notes.
+
+
+===============================================================================
+APPENDIX - THE FULL JOURNEY OF ONE IMU SAMPLE
+===============================================================================
+(Assumes the board wiring exists and IMU0 is on SPI; values from the tests.)
+
+1. PHYSICAL SENSOR
+   The LSM6DSRX's MEMS proof mass deflects under 1 g of gravity on its Z axis.
+   Its internal ADC samples at 416 Hz (CTRL1_XL = 0x64) and stores
+   +2048 (0x0800) in OUTZ_L_A/OUTZ_H_A (0x2C/0x2D) at +-16 g
+   (0.488 mg/LSB). BDU guarantees the two bytes belong to the same sample.
+
+2. TIME TO SAMPLE
+   SensorAcquisitionTask (priority 40) wakes from xTaskDelayUntil every 10 ms.
+   It calls ImuSource::service(now, hub_). The source's period (10 ms) is due,
+   so it calls readAndPublish(), which calls Lsm6dsrx::read(sample).
+
+3. SPI TRANSACTION
+   Lsm6dsrx::readRaw -> bus_.readRegisters(0x20, buf, 14)
+   SpiRegisterBus builds the command byte (0x20 & 0x7F) | 0x80 = 0xA0 and
+   calls ISpiDevice::writeThenRead(&cmd, 1, buf, 14).
+   HalSpiDevice: CS low (HAL_GPIO_WritePin RESET), HAL_SPI_Transmit(0xA0),
+   HAL_SPI_Receive(14 bytes), CS high. The chip auto-increments the register
+   address (IF_INC) so 14 bytes stream out: temperature, gyro XYZ, accel XYZ.
+   (Before that, a 1-byte read of STATUS 0x1E -> 0x07: all data fresh.)
+
+4. RAW BYTES
+   buf = { T_L, T_H, GX_L, GX_H, GY_L, GY_H, GZ_L, GZ_H,
+           AX_L, AX_H, AY_L, AY_H, 0x00, 0x08 }
+   Validity check 1: not all 0x00 and not all 0xFF (else InvalidData).
+
+5. DECODED VALUE
+   raw.accel[2] = le_i16(&buf[12]) = (int16_t)(0x00 | 0x08 << 8) = 0x0800 = +2048
+   (had it been 0x00 0xF8 -> 0xF800 -> -2048: the board upside down.)
+
+6. SI CONVERSION
+   accelScale = 0.488 mg/LSB * 1e-3 * 9.80665 = 0.0047856 m/s^2 per LSB
+   2048 * 0.0047856 = 9.8010 m/s^2
+   The scale was computed once in init(), so this is one multiplication.
+
+7. VALIDITY CHECKS
+   accelSaturated = any axis == +32767 or -32768 -> false
+   accelFresh = STATUS & XLDA -> true
+   header.id = SensorId::Imu0, header.timestampMs = clock.millis(),
+   header.sequence = ++sequence_ (gaps reveal lost samples), header.valid = true.
+   health_.recordSuccess(now).
+
+8. COMMON SENSOR DATA
+   ImuSource wraps it: SensorMessage::fromImu(sample) -> type = Imu, union
+   member imu = sample. The struct is trivially copyable (static_assert).
+
+9. PUBLICATION
+   SensorDataHub::publish(msg): for each subscriber queue, tryPush(msg) with
+   a 0-tick timeout (xQueueSend copies the bytes into the queue's static
+   storage). If a queue is full, that subscriber's drop counter increments;
+   sampling continues regardless.
+
+10. RTOS CONSUMER (future algorithm task)
+   Blocked in RtosSampleQueue::popWait(msg, ticks) -> xQueueReceive. The
+   kernel makes it Ready when the message arrives; when no higher-priority
+   task is running it copies the message out, checks msg.type == Imu and
+   msg.imu.header.valid, and uses msg.imu.accel_mps2.z = 9.801 m/s^2 -
+   already in SI units, in the sensor's axes, with a timestamp and sequence
+   number, without ever knowing which SPI bus or chip-select produced it.
+
+11. MONITORING
+   Once per second HealthMonitorTask copies successCount, failures, cycle
+   times, drops and stack high-water marks into pg::g_systemHealth, which you
+   can watch live in the debugger.
+
+===============================================================================
+END OF WALKTHROUGH
+===============================================================================
