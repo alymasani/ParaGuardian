@@ -8,13 +8,28 @@
 
 #include "SystemDefines.hpp"
 #include "Acquisition/SensorDataHub.hpp"
+#include "Algorithms/Attitude/AttitudeFrameAdapter.hpp"
+#include "Algorithms/Navigation/NavigationInputAdapter.hpp"
+#include "Algorithms/Crash/CrashInputAdapter.hpp"
+#include "Algorithms/Safety/SafetyInput.hpp"
 #include "BSP/RtosClock.hpp"
 
 SensorProcessingTask::SensorProcessingTask()
     : Task(0u),  // no SoarOS command queue: data arrives through queue_
       pipeline_(pg::PreprocessingConfig{}),
-      frames_(frameLock_)
+      frames_(frameLock_),
+      attitude_(pg::AttitudeConfig{}),
+      attitudeOut_(attitudeLock_),
+      navModel_(pg::ConstantAccelerationModel::fromConfig(pg::NavigationConfig{})),
+      navigation_(pg::NavigationConfig{}, navModel_),
+      navigationOut_(navigationLock_),
+      safety_(pg::SafetyConfig{}),
+      safetyOut_(safetyLock_),
+      safetyEvents_(safetyEventLock_),
+      crash_(pg::CrashConfig{}),
+      crashOut_(crashLock_)
 {
+    safety_.addSink(&safetyEvents_);   // before the scheduler starts: no locking needed
 }
 
 void SensorProcessingTask::InitTask()
@@ -25,6 +40,10 @@ void SensorProcessingTask::InitTask()
 void SensorProcessingTask::InitTask(pg::SensorDataHub& hub)
 {
     SOAR_ASSERT(rtTaskHandle == nullptr, "SensorProcessingTask created twice");
+    SOAR_ASSERT(attitude_.configValid(), "SensorProcessingTask: invalid AttitudeConfig");
+    SOAR_ASSERT(navigation_.configValid(), "SensorProcessingTask: invalid NavigationConfig / process model");
+    SOAR_ASSERT(safety_.configValid(), "SensorProcessingTask: invalid SafetyConfig");
+    SOAR_ASSERT(crash_.configValid(), "SensorProcessingTask: invalid CrashConfig");
 
     // Static queue: no FreeRTOS heap use, cannot fail for lack of memory.
     const bool queueOk = queue_.create();
@@ -84,8 +103,33 @@ void SensorProcessingTask::Run(void* /*pvParams*/)
         pipeline_.buildFrame(clock.millis(), work_);
         frames_.publish(work_);
 
+        // Attitude: one estimator update per frame. A gyro sample is integrated
+        // only if its timestamp is newer than the last one (no double integration).
+        attitude_.update(pg::attitudeInputFromFrame(work_));
+        attitudeOut_.publish(attitude_.latest());
+
+        // Vertical navigation (UKF): one update per frame, after attitude (it uses
+        // this frame's gravity-compensated vertical acceleration). Each barometer,
+        // acceleration and GNSS sample is assimilated once, at its own timestamp.
+        navigation_.update(pg::navigationInputFrom(work_, attitude_.latest()));
+        navigationOut_.publish(navigation_.latest());
+
+        // Flight / landing safety: clearance -> phase -> warnings, from THIS frame's
+        // attitude and navigation. Events (transitions only) go to safetyEvents_.
+        safetyOut_.publish(safety_.update(pg::safetyInputFrom(work_, attitude_.latest(), navigation_.latest())));
+
+        // Crash detection: per-IMU impact peaks of THIS frame (before any smoothing) plus the
+        // context above. Its events share the safety emitter (one event-id sequence per task).
+        pg::updateIncidentContext(incident_, work_, navigation_.latest());
+        crashReport_.status = crash_.update(
+            pg::crashInputFrom(work_, attitude_.latest(), safety_.latest(), navigation_.latest()),
+            safety_.eventEmitter());
+        crashReport_.context = incident_;
+        crashReport_.publishedMs = clock.millis();
+        crashOut_.publish(crashReport_);
+
         const uint32_t elapsed = clock.millis() - start;
-        stats_.lastProcessingTimeMs = elapsed;
+        stats_.lastProcessingTimeMs = elapsed;   // includes attitude, navigation and safety updates
         if (elapsed > stats_.maxProcessingTimeMs) stats_.maxProcessingTimeMs = elapsed;
         if (n > stats_.maxBatch) stats_.maxBatch = n;
         stats_.messages = (UINT32_MAX - stats_.messages < n) ? UINT32_MAX : stats_.messages + n;

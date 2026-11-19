@@ -30,6 +30,8 @@ public:
     virtual void setPattern(LedPattern pattern, LedColor color = LedColor::Default) = 0;
     /// Called periodically (e.g. every 10 ms) by the owning task to animate patterns.
     virtual void tick(uint32_t nowMs) = 0;
+    /// False while no LED hardware is configured (pins unknown). Default: available.
+    virtual bool available() const { return true; }
 
 protected:
     ~IStatusLed() = default;

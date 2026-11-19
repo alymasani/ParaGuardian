@@ -43,7 +43,9 @@ constexpr uint8_t INIT_ATTEMPTS_PER_CYCLE = 1u;       // driver init() calls all
 // acquisition cycle blocks, and finds that cycle's whole burst in its queue.
 constexpr UBaseType_t PROCESSING_PRIORITY = static_cast<UBaseType_t>(osPriorityAboveNormal);  // 32
 // 4 KiB: pipeline calls are shallow (<= ~6 frames, doubles, one pow()); the
-// pipeline state and the output frame are class members, not stack variables.
+// pipeline state, the output frame and the attitude estimator are class
+// members, not stack variables. The attitude update adds a ~0.1 KB input copy
+// and a few float locals (measured with -fstack-usage: MADGWICK_VALIDATION_REPORT.md).
 // Confirm with the Health task's stack high-water mark on hardware.
 constexpr uint32_t PROCESSING_STACK_WORDS = 1024u;
 // Queue depth: ~575 msg/s produced (RTOS_TIMING_ANALYSIS.md section 7) = ~6 per
@@ -53,6 +55,25 @@ constexpr size_t PROCESSING_QUEUE_DEPTH = 64u;
 // If no sample arrives for this long, a frame is still produced so consumers
 // and the health monitor SEE that the sensors are missing (no silent stall).
 constexpr uint32_t PROCESSING_IDLE_TIMEOUT_MS = 50u;
+// Safety events (transitions only: a few per flight phase / warning episode).
+// 16 x 40 B = 640 B. Overflow keeps the most severe events (SafetyEventQueue.hpp).
+constexpr size_t SAFETY_EVENT_QUEUE_DEPTH = 16u;
+
+// ---- Emergency / alert task (crash -> emergency manager -> alert dispatcher) ------
+// Priority 36: ABOVE processing (32) so a processing overload can never starve an
+// SOS countdown, cancellation or retry; BELOW acquisition (40) so sampling is never
+// delayed. Its work per wake is small and bounded (a few commands / reports, at most
+// one event queue's worth of events, two state machines): estimated well under 0.1 ms
+// at 64 MHz (CRASH_EMERGENCY_DESIGN.md section 13). It wakes every
+// EMERGENCY_PERIOD_MS (countdown / retry timing does NOT depend on sensor frames) or
+// immediately when a command / transport report is submitted (task notification).
+constexpr UBaseType_t EMERGENCY_PRIORITY = static_cast<UBaseType_t>(osPriorityAboveNormal4);  // 36
+constexpr uint32_t EMERGENCY_STACK_WORDS = 768u;      // 3 KiB; measured need in CRASH_EMERGENCY_VALIDATION_REPORT.md
+constexpr uint32_t EMERGENCY_PERIOD_MS = 20u;         // 50 Hz: countdown resolution and audio beat
+constexpr size_t EMERGENCY_COMMAND_DEPTH = 8u;        // manual SOS / cancel / ack / reset (pilot-speed input)
+constexpr size_t EMERGENCY_REPORT_DEPTH = 8u;         // transport / phone reports
+constexpr size_t EMERGENCY_EVENT_DEPTH = 8u;          // emergency manager's own events (same task)
+constexpr size_t EMERGENCY_MAX_EVENTS_PER_WAKE = SAFETY_EVENT_QUEUE_DEPTH;   // bounded drain
 
 // ---- Health monitor -----------------------------------------------------------
 constexpr UBaseType_t HEALTH_PRIORITY = static_cast<UBaseType_t>(osPriorityBelowNormal);  // 16
@@ -68,6 +89,9 @@ static_assert(ACQUISITION_PRIORITY < configMAX_PRIORITIES, "priority out of rang
 static_assert(HEALTH_PRIORITY < configMAX_PRIORITIES, "priority out of range");
 static_assert(PROCESSING_PRIORITY < ACQUISITION_PRIORITY, "processing must never preempt acquisition");
 static_assert(PROCESSING_PRIORITY > HEALTH_PRIORITY, "processing should run before diagnostics");
+static_assert(EMERGENCY_PRIORITY < ACQUISITION_PRIORITY, "emergency task must never preempt acquisition");
+static_assert(EMERGENCY_PRIORITY > PROCESSING_PRIORITY, "a processing overload must not starve the SOS countdown");
+static_assert(EMERGENCY_STACK_WORDS >= configMINIMAL_STACK_SIZE, "stack too small");
 static_assert(PROCESSING_STACK_WORDS >= configMINIMAL_STACK_SIZE, "stack too small");
 static_assert(ACQUISITION_STACK_WORDS >= configMINIMAL_STACK_SIZE, "stack too small");
 static_assert(HEALTH_STACK_WORDS >= configMINIMAL_STACK_SIZE, "stack too small");

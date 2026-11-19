@@ -11,6 +11,7 @@
 #include "Acquisition/SampleFreshness.hpp"
 #include "BSP/RtosClock.hpp"
 #include "Processing/TimeBase.hpp"
+#include "Tasks/EmergencyAlertTask.hpp"
 #include "Tasks/SensorAcquisitionTask.hpp"
 #include "Tasks/SensorProcessingTask.hpp"
 
@@ -20,6 +21,18 @@ namespace pg {
 __attribute__((used)) SystemHealthSnapshot g_systemHealth = {};
 extern volatile uint32_t g_tickFallbackIncrements;  // Components/SysCore/HalTickFallback.cpp
 }  // namespace pg
+
+namespace {
+/// value * scale rounded to int32; non-finite or out-of-range -> INT32_MIN (debugger-visible "invalid").
+int32_t toScaledInt(float value, float scale)
+{
+    const float v = value * scale;
+    if (!(v > -2.0e9f && v < 2.0e9f)) {  // false for NaN as well
+        return INT32_MIN;
+    }
+    return static_cast<int32_t>(v >= 0.0f ? v + 0.5f : v - 0.5f);
+}
+}  // namespace
 
 void HealthMonitorTask::InitTask()
 {
@@ -140,6 +153,143 @@ void HealthMonitorTask::collect()
         h.baroContributingMask = f.baroAltitude_m.contributingMask;
         for (uint8_t i = 0; i < 3u; ++i) h.imuGyroCalibration[i] = static_cast<uint8_t>(f.imu[i].gyroCalibration);
         for (uint8_t j = 0; j < 2u; ++j) h.baroReferenceState[j] = static_cast<uint8_t>(f.baro[j].referenceState);
+    }
+    if (proc.attitude().read(attitudeCopy_)) {   // locked copy into a member
+        const pg::AttitudeEstimate& a = attitudeCopy_;
+        h.attitudeSequence = a.sequence;
+        h.attitudeAgeMs = a.orientationValid ? pg::timebase::ageMs(a.timestampMs, now) : UINT32_MAX;
+        h.attitudeQualityFlags = a.qualityFlags;
+        h.attitudeState = static_cast<uint8_t>(a.state);
+        h.headingReference = static_cast<uint8_t>(a.heading);
+        h.accelCorrection = static_cast<uint8_t>(a.accelCorrection);
+        h.magCorrection = static_cast<uint8_t>(a.magCorrection);
+        h.rollCentiDeg = a.orientationValid ? toScaledInt(a.eulerDeg.roll, 100.0f) : INT32_MIN;
+        h.pitchCentiDeg = a.orientationValid ? toScaledInt(a.eulerDeg.pitch, 100.0f) : INT32_MIN;
+        h.yawCentiDeg = a.orientationValid ? toScaledInt(a.eulerDeg.yaw, 100.0f) : INT32_MIN;
+        h.verticalAccel_mmps2 = a.linearAccel.valid ? toScaledInt(a.linearAccel.vertical_mps2, 1000.0f) : INT32_MIN;
+        h.attitudeInitializations = a.initializations;
+        h.attitudeInvalidations = a.invalidations;
+        h.attitudeRecoveries = a.recoveries;
+        h.attitudeGaps = a.gaps;
+        h.attitudeAccelRejections = a.accelRejections;
+        h.attitudeNumericalFaults = a.numericalFaults;
+    }
+    if (proc.navigation().read(navigationCopy_)) {   // locked copy into a member
+        const pg::NavigationEstimate& n = navigationCopy_;
+        h.navSequence = n.sequence;
+        h.navState = static_cast<uint8_t>(n.state);
+        h.navProcessModel = static_cast<uint8_t>(n.processModel.id);
+        h.navBaroOutcome = static_cast<uint8_t>(n.baro.last);
+        h.navAccelOutcome = static_cast<uint8_t>(n.accel.last);
+        h.navGnssOutcome = static_cast<uint8_t>(n.gnss.last);
+        h.navQualityFlags = n.qualityFlags;
+        h.navAltitude_cm = n.altitudeValid ? toScaledInt(n.altitude_m, 100.0f) : INT32_MIN;
+        h.navVerticalVelocity_mmps = n.velocityValid ? toScaledInt(n.verticalVelocity_mps, 1000.0f) : INT32_MIN;
+        h.navVerticalAccel_mmps2 = n.accelerationValid ? toScaledInt(n.verticalAccel_mps2, 1000.0f) : INT32_MIN;
+        h.navAltitudeSigma_cm = toScaledInt(n.altitudeSigma_m, 100.0f);          // NaN -> INT32_MIN
+        h.navVelocitySigma_mmps = toScaledInt(n.velocitySigma_mps, 1000.0f);
+        h.navPredictionAgeMs = n.predictionAgeMs;
+        h.navOutageMs = n.outageMs;
+        h.navBaroAccepted = n.baro.accepted;
+        h.navBaroRejected = n.baro.rejectedGate;
+        h.navAccelAccepted = n.accel.accepted;
+        h.navAccelRejected = n.accel.rejectedGate + n.accel.rejectedQuality;
+        h.navGnssAccepted = n.gnss.accepted;
+        h.navRecoveries = n.baro.recoveries + n.accel.recoveries + n.gnss.recoveries;
+        h.navInitializations = n.initializations;
+        h.navUnavailableEpisodes = n.unavailableEpisodes;
+        h.navNumericalFaults = n.numericalFaults;
+        h.navLastFaultCode = n.lastFaultCode;
+    }
+    if (proc.safety().read(safetyCopy_)) {   // locked copy into a member
+        const pg::SafetySnapshot& s = safetyCopy_;
+        h.safetySequence = s.sequence;
+        h.flightPhase = static_cast<uint8_t>(s.phase);
+        h.flightPhaseSupport = static_cast<uint8_t>(s.phaseSupport);
+        h.clearanceStatus = static_cast<uint8_t>(s.clearanceStatus);
+        h.highestWarningSeverity = s.activeWarningMask != 0u ? static_cast<uint8_t>(s.highestSeverity) : 0u;
+        h.activeWarningMask = s.activeWarningMask;
+        h.clearance_cm = s.clearanceValid ? toScaledInt(s.clearance_m, 100.0f) : INT32_MIN;
+        h.closureRate_mmps = s.closureRateValid ? toScaledInt(s.closureRate_mps, 1000.0f) : INT32_MIN;
+        h.timeToContact_ms = s.ttcValid ? toScaledInt(s.timeToContact_s, 1000.0f) : INT32_MIN;
+        h.safetyQualityFlags = s.qualityFlags;
+        h.flightPhaseTransitions = s.phaseTransitions;
+        h.takeoffs = s.takeoffs;
+        h.landings = s.landings;
+        h.warningsRaised = s.warningsRaised;
+        h.lowClearanceRaised = s.lowClearanceRaised;
+        h.suppressedReactivations = s.suppressedReactivations;
+        h.lidarRejectedSamples = s.lidarRejectedSamples;
+        h.clearanceStaleUpdates = s.clearanceStaleUpdates;
+        h.safetyEventsPublished = s.eventsPublished;
+    }
+    {
+        const pg::SafetyQueueStats q = proc.safetyEvents().stats();
+        h.safetyQueueDepth = static_cast<uint32_t>(proc.safetyEvents().size());
+        h.safetyQueueHighWater = q.highWater;
+        h.safetyQueueDroppedNew = q.droppedNew;
+        h.safetyQueueDroppedQueued = q.droppedQueued;
+        h.safetyQueueDroppedCritical = q.droppedCritical;
+    }
+    if (proc.crashReports().read(crashCopy_)) {   // locked copy into a member
+        const pg::CrashStatus& c = crashCopy_.status;
+        h.crashState = static_cast<uint8_t>(c.state);
+        h.crashDecision = static_cast<uint8_t>(c.decision);
+        h.crashImpactClass = static_cast<uint8_t>(c.impact.cls);
+        h.crashEvidence = c.evidence;
+        h.crashFlags = c.flags;
+        h.crashPeakAccel_cg = c.impactCandidates != 0u ? toScaledInt(c.impact.peakAccel_mps2 / 9.80665f, 100.0f)
+                                                       : INT32_MIN;
+        h.impactCandidates = c.impactCandidates;
+        h.crashSuspicions = c.suspicions;
+        h.crashRejections = c.rejections;
+        h.crashSuspicionsCleared = c.suspicionsCleared;
+        h.crashSaturationEvents = c.saturationEvents;
+        h.crashUncorroboratedPeaks = c.uncorroboratedPeaks;
+    }
+    const EmergencyAlertTask& emt = EmergencyAlertTask::Inst();
+    if (emt.emergency().read(emergencyCopy_)) {
+        const pg::EmergencyStatus& e = emergencyCopy_;
+        h.emergencyState = static_cast<uint8_t>(e.state);
+        h.incidentTrigger = static_cast<uint8_t>(e.trigger);
+        h.deliveryStage = static_cast<uint8_t>(e.stage);
+        h.cancelNotice = static_cast<uint8_t>(e.cancelNotice);
+        h.currentIncidentId = e.incidentId;
+        h.countdownRemainingMs = e.countdownRemainingMs;
+        h.reportedStages = e.reportedStages;
+        h.emergencyFlags = e.flags;
+        h.incidents = e.incidents;
+        h.manualSosCount = e.manualSosCommands;
+        h.cancellationCount = e.cancellations;
+        h.cancellationsAfterSend = e.cancellationsAfterSend;
+        h.sosRequestCount = e.sosRequestsCreated;
+        h.transportAttempts = e.transportAttempts;
+        h.transportFailures = e.transportFailures;
+        h.deliveriesConfirmed = e.deliveriesConfirmed;
+        h.deliveriesFailed = e.deliveriesFailed;
+        h.deliveriesUnknown = e.deliveriesUnknown;
+        const uint64_t rejected = static_cast<uint64_t>(e.commandsRejected) + e.commandsWrongIncident + e.commandsNotAllowed;
+        h.emergencyCommandsRejected = rejected > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(rejected);
+    }
+    h.emergencyCommandsDropped = emt.commandsDropped();
+    if (emt.dispatch().read(dispatchCopy_)) {
+        const pg::DispatchStatus& d = dispatchCopy_;
+        h.audioAlert = static_cast<uint8_t>(d.audioAlert);
+        h.audioState = static_cast<uint8_t>(d.audioState);
+        h.ledAlert = static_cast<uint8_t>(d.ledAlert);
+        h.ledState = static_cast<uint8_t>(d.ledState);
+        h.alertEventsConsumed = d.eventsConsumed;
+        h.alertEventGaps = d.eventGaps;
+        h.alertMaxLatencyMs = d.maxLatencyMs;
+        h.audioFailures = d.audioFailures;
+    }
+    h.alertBacklog = static_cast<uint32_t>(proc.safetyEvents().size()) + emt.localEventBacklog();
+    {
+        const EmergencyAlertTask::Stats es = emt.stats();
+        h.emergencyWakes = es.wakes;
+        h.emergencyMaxWorkMs = es.maxWorkMs;
+        h.emergencyMaxWakeIntervalMs = es.maxWakeIntervalMs;
+        h.emergencyLateWakes = es.lateWakes;
     }
 
     h.taskCount = watchedCount_;

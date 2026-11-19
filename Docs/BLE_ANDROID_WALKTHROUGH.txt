@@ -1,0 +1,291 @@
+PARAGUARDIAN MILESTONE 7
+BLE AND ANDROID COMPANION WALKTHROUGH
+
+Read BLE_ANDROID_ARCHITECTURE.md for byte offsets and message contracts.
+Read BLE_ANDROID_VALIDATION_REPORT.md for the checks actually run.
+
+A. BLUETOOTH LOW ENERGY
+
+BLE carries small application records over a short-range radio connection.
+The STM32 would hand a packet to the CYW20822 module. The module owns the
+wireless stack. Android receives a packet through BluetoothGatt callbacks.
+Weather, terrain, body position, power and radio interference affect this path.
+
+B. PERIPHERAL AND CENTRAL
+
+The peripheral advertises and the central scans and initiates a connection.
+Here the device advertises the service and Android initiates the link. These
+roles describe connection behavior. GATT server and client describe access to
+attributes after a connection exists. For this design the peripheral serves
+the attributes and Android subscribes and writes.
+
+C. GATT SERVICES AND CHARACTERISTICS
+
+A service groups related attributes under a UUID. A characteristic has a
+value and operations such as read, write, notify and indicate. Android writes
+the Client Characteristic Configuration Descriptor to opt in to updates.
+An indication has a link-level confirmation. Its reception can occur before
+the application parses or commits the incident, so the phone sends a separate
+report once durable storage succeeds.
+
+D. FRAMING
+
+The existing SOS has 64 bytes with fixed field offsets. The outer envelope
+identifies what the bytes mean, how many to expect, which incident they belong
+to and the sequence in the current session. A separate layer lets the sender
+keep the M6 payload intact while carrying commands, reports and status.
+
+E. MTU
+
+The Attribute Protocol MTU limits the size of an ATT unit. A default MTU of
+23 leaves 20 bytes in the operations used here. The ATT limit is different
+from a UART frame size, a radio packet size or a complete application message.
+
+F. FRAGMENTS
+
+Six of those 20 bytes identify the sequence, offset and full envelope size.
+The remaining 14 bytes carry data. An 80-byte SOS envelope starts at offsets
+0, 14, 28, 42, 56 and 70. The last part carries 10 data bytes. The receiver
+copies in order into a small fixed buffer and rejects gaps. A new higher
+sequence can replace an unfinished one. A two-second deadline keeps missing
+parts from reserving the buffer forever. On disconnect, both sides discard
+partial state.
+
+G. CRC
+
+A CRC detects many accidental changes. Anyone with the payload can calculate
+a new CRC. Identity, encryption, message authorization and replay resistance
+need a separate security context. The codec methods check matching sequence
+and length in addition to CRC before returning a message.
+
+H. ASSOCIATION, BONDING AND AUTHORIZATION
+
+Android association remembers the user's chosen device. Pairing negotiates
+security, and bonding retains keys for later connections. Encryption protects
+traffic in transit. Authentication establishes the intended peer, and
+authorization decides which peer can perform a particular command.
+A physical link must supply authenticated identity and session evidence at both
+ends, then restrict GATT access to the authorized peer. The current hardware
+adapters fail closed. The simulator uses an explicitly separate trust domain.
+
+I. ANDROID DISCOVERY
+
+The system companion picker filters scan results by service UUID. It returns
+a candidate device. Selecting it saves the address for future discovery.
+When monitoring begins, the app connects, requests MTU, discovers the service,
+subscribes sequentially and evaluates the trust adapter. An unverified GATT
+connection is visible as unverified and remains unable to carry alerts.
+
+J. FOREGROUND SERVICE
+
+An Activity is the visible screen. A Service can exist while it is closed.
+A foreground service makes an ongoing task visible to the user. ParaGuardian
+uses the connected-device type and an ongoing notification with Stop. The
+service owns the physical connection lifecycle. The status in the activity
+comes from the application state shared with the service.
+
+K. PERMISSIONS
+
+On Android 12 and later, request nearby Bluetooth permissions at setup.
+Android 13 adds a notification prompt. Notification denial can suppress a
+critical notification without invalidating records already stored. Android
+14 and later enforce the connected-device foreground service type and its
+prerequisites. Optional location has its own runtime prompt.
+
+L. BACKGROUND RESTRICTIONS
+
+Start monitoring from a visible app. The service can persist when the screen
+is off or UI is dismissed, subject to device policies. A stopped or killed
+process loses its GATT connection. ParaGuardian asks the pilot to restart
+monitoring after reopening. Reconnect backoff is useful for range and adapter
+outages while the service exists. The emulator cannot certify radio or
+device-specific power-management behavior.
+
+M. COROUTINES AND FLOW
+
+A coroutine can wait asynchronously for disk work or a timer. It yields the
+main thread, so UI and Bluetooth callbacks can continue. The application
+uses a bounded Channel to serialize received packets and an IO dispatcher
+with parallelism one for durable state transitions. StateFlow publishes the
+latest snapshot to the UI. A disconnect invalidates packets from an old
+generation even if they are still in the channel.
+
+N. ROOM, DATASTORE AND STORAGE CHOICE
+
+Room adds typed access and compile-time checking to SQLite. DataStore
+persists small settings or typed objects. This app uses Android's SQLite
+helper directly for one schema and uses private SharedPreferences for a
+small settings bundle. Durable incident and provider stage transitions
+are centralized in EmergencyEngine. A failed commit produces no acceptance.
+Preferences commits return success and the screen updates afterward.
+
+O. INCIDENT IDENTITY AND HISTORY
+
+The incident key combines an authenticated device identity with an incident
+ID. The STM32 starts at 1 and skips 0. A revision updates an existing incident.
+Android keeps the same row after a retry, regardless of the BLE sequence.
+Clearing history removes position and raw SOS and retains a minimal marker
+for deduplication. The MCU uses a null persistent store in this build.
+A real deployment needs reset-safe identity and request storage.
+
+P. RETRIES AND ACKNOWLEDGMENTS
+
+The device keeps a pending request while offline. Accepted transport queue
+entries count as attempts, with a 10-second phone acceptance deadline.
+Eight unsuccessful attempts exhaust one cycle. A new link can start
+limited recovery cycles without changing the incident ID. A phone acceptance
+means the database has committed. Provider status may arrive later. The phone
+can repeat the recorded stages without a second send.
+
+Q. TRANSPORT VERSUS SMS
+
+A GATT write response means a Bluetooth-side write completed. In simulation
+the mock provider explicitly returns its outcome. On a real phone, the app
+uses ACTION_SENDTO with an smsto URI only after the pilot selects an approved
+recipient. The composer needs a separate tap on Send. ParaGuardian tracks
+which composers were opened. It cannot infer when a contact received a message.
+
+R. DELIVERY EVIDENCE
+
+Stored, send attempted, provider accepted, delivery reported, failed, unknown
+and cancelled before send are distinct. A provider may accept a message and
+never supply meaningful recipient delivery evidence. A cancelled notice
+after a composer or provider attempt cannot recall that message.
+
+S. DISCONNECTION
+
+The MCU keeps monitoring the crash detector and keeps the unresolved record.
+Audio and LED scheduling do not wait on the radio. With the null module port,
+the manager stays pending after expiry. When a real backend later reconnects,
+the retry policy determines when to resend. In simulation, Disconnect and
+Connect substitute for the same packet boundary.
+
+T. PROCESS TERMINATION
+
+A fresh app opens the database. A stored incident with no attempt can proceed.
+An interrupted attempt is marked unknown because a call could have completed
+before the process died. Repeated device frames retrieve the saved stages.
+Android starts with monitoring inactive, so physical GATT must be restarted
+by the pilot. The simulator's Restart incident engine control exercises
+repository reopening while retaining the peripheral identity.
+
+U. COMMANDS
+
+Manual device SOS sends opcode 1. With no current incident, incident zero
+asks to open one. During a countdown the command can confirm the current
+incident. Cancel sends opcode 2 with the exact visible incident. The MCU
+uses receipt uptime for the deadline. UI confirmation depends on the next
+authoritative status. A phone-originated manual SOS prepares its own draft.
+The app asks for confirmation before starting either manual path.
+
+V. FILES AND OWNERSHIP
+
+BleProtocol.hpp and BleProtocol.cpp define the envelope, little-endian
+load/store helpers, fragmentation and reassembly. encode() computes a CRC
+after copying the declared payload. push() checks a fragment before copying
+and remembers completed sequences. test_ble_m7 exercises corrupted lengths,
+versions, reordering, duplicate packets and clock wrap. Serializing a native
+C++ object would tie the protocol to compiler layout.
+
+BleEmergencyBridge.hpp and BleEmergencyBridge.cpp own the non-blocking packet
+port and its buffers. receive() checks trust and generation, drains at most
+four packets and applies only correlated reports and authorized commands.
+transmit() attempts one packet and prioritizes an SOS over status. The fake
+port tests disconnect, corruption, wrong revisions, unauthorized peers and
+backpressure. The shipped packet port stays unconfigured.
+
+EmergencyAlertTask.cpp supplies the latest crash and safety snapshots and polls
+the bridge in its existing wake loop. It uses dedicated mailboxes for status,
+SOS and diagnostics. EmergencyManager.cpp owns attempts and recovery and
+applies explicit unknown outcomes, without changing the crash detector.
+The host tests exercise their portable logic. Native firmware builds verify
+integration. Target timing still needs measurements.
+
+Protocol.kt mirrors the C++ byte layouts with little-endian ByteBuffer.
+Reassembly emits a checked Frame. sos() validates the inner CRC and incident
+identity. status() decodes usability bits before displaying numbers. The
+JVM tests compare the shared vectors and drive the native C++ peer.
+
+BluetoothLink.kt owns validity of a GATT connection and the ordered Android
+operations. A Handler brings callbacks onto the same thread. runIfCurrent()
+drops callbacks from a closed connection. The lifecycle transitions publish
+the actual state. Android Emulator validation covers the application, and the
+hardware matrix covers the remaining physical GATT behavior.
+
+Emergency.kt owns delivery state and the input contract for stores. receive()
+validates, stores and returns the record to acknowledge. proceed() records
+an attempt before the mock call. recover() converts interrupted attempts to
+unknown. The SMS composer does not supply a reliable delivery callback so
+it is modeled as operator action and persists each recipient reservation.
+Host tests cover stage changes, deduplication, storage error and location.
+
+Storage.kt supplies the database and user preferences. SQLite transactions
+preserve the primary key and redaction flag across updates. Test coverage
+reopens a database, recovers interrupted work and verifies that sensitive
+details are gone after redaction. Database schema changes require migration.
+
+GuardianApplication.kt routes packets and UI actions. It sequences the
+durable acceptance, provider work and stage reports, and exposes StateFlow.
+Simulation settings never invoke the physical delivery adapter. In-app
+events describe the workflow without personal data. SimulationUiTest checks
+a crash reaching a visible delivery state in the running Android app.
+
+Simulator.kt is an in-process peripheral with short, controllable clocks
+and the same wire format. It signs no physical credentials and uses a
+temporary simulated device ID. The extra C++ peer program runs actual M6
+flight, detector and emergency logic, so the two simulators serve different
+levels of validation.
+
+MonitoringService.kt creates ongoing and critical notification channels.
+It starts foreground monitoring promptly and shuts it down when stopped.
+The persistent notification has a Stop PendingIntent. Permission-denial and
+Activity-recreation tests cover the app behavior. Paired real phones are
+needed for long-duration monitoring.
+
+PhoneLocation.kt checks permission before querying Android LocationManager.
+It waits up to three seconds for a fresh fix on supported versions, falls
+back to the newest allowed cached fix and returns null when none qualifies.
+The payload and phone records preserve the accuracy and age. There is no
+continuous or background location job.
+
+MainActivity.kt implements the Setup, Device, Contacts, Emergency, History
+and Settings views. It coordinates permissions, companion selection and the
+external SMS composer. Compose updates from state to avoid stale connected
+or cancelled labels. The instrumentation test drives the emergency flow via
+the visible controls.
+
+W. REPLACING THE SIMULATOR
+
+Follow BLE_ANDROID_HARDWARE_INTEGRATION.md. Select the actual UART and module
+firmware, establish secure pairing and implement PacketPort and PhysicalTrust.
+Do not paste example vendor commands from other modules. Schedule UART or
+module work outside the timing-critical loop. Only publish connected trust
+after a verified session. Test it with a second untrusted phone.
+
+X. WORKED EXAMPLE AND RUNNING IT
+
+In the Android UI, connect the simulator and open Emergency. Select Flight,
+Suspect crash, then Advance 31 seconds. The UI shows the countdown first.
+At expiry the Kotlin simulator transmits the 64-byte SOS in six pieces. The
+receiver validates both CRCs and deduplicates the incident. SQLite commits
+the SOS, after which the phone returns acceptance. The mock provider returns
+delivery and the UI shows it as a simulation. Try corruption and lost reports
+to see why pending state and duplicate handling matter.
+
+The host C++ peer starts a simulated flight and uses real sensor-like crash
+evidence to drive CrashDetector, then EmergencyManager. The manager observes
+the suspected crash and opens its normal automatic countdown. At expiry the
+bridge wraps and fragments the SOS. The Kotlin test confirms the device is
+still waiting after deliberately dropping all phone reports. It reconnects,
+receives the same incident, reads its prior result and returns phone
+acceptance, send attempted and simulated delivery. The C++ manager reaches
+Delivered and the mock provider count remains one.
+
+Y. BEFORE FIELD TESTING
+
+Confirm board pinout, loaded module firmware and RF performance. Commission
+an authenticated link, persistent device identity and brownout-safe
+emergency storage. Measure stack and timing on target. Prove background BLE
+behavior on real phones. If unattended delivery is required, configure an
+authorized provider and validate realistic contact outcomes with approved test
+recipients. Verify the local alert and pilot cancellation controls independently.

@@ -1,0 +1,661 @@
+PARAGUARDIAN - VERTICAL UKF WALKTHROUGH (Milestone 4)
+====================================================
+
+Date: 2026-11-18
+Audience: an engineering student who knows vectors, matrices and basic
+probability (mean, standard deviation), but has never written a Kalman
+filter.
+
+What this document is: a guided tour of the ACTUAL code in
+Components/Algorithms/Navigation/ and how it connects to the rest of the
+firmware. Every file, function and number below refers to the code as it is
+in the repository today. The worked numbers in sections E-H were produced by
+running the real classes, not by hand.
+
+What this document is NOT: evidence that the altitude or vertical-speed
+estimate is right on a real paraglider. Everything was tested in simulation
+on a laptop. Nothing ran on the STM32. Nothing has flown.
+
+AI-use disclosure: this code and this document were produced with AI
+assistance (Claude Code), under the student's direction, for the student's
+review. Attribute it accordingly under your university's policy.
+
+Companion documents:
+  Docs/VERTICAL_UKF_DESIGN.md             decisions, equations, parameters
+  Docs/VERTICAL_UKF_VALIDATION_REPORT.md  every measured number
+  Docs/MADGWICK_ATTITUDE_WALKTHROUGH.txt  where the vertical acceleration comes from
+
+Contents
+  A. Why altitude estimation needs filtering
+  B. What a "state" is
+  C. What covariance represents
+  D. Why measurement noise matters
+  E. How a Kalman filter works (with a one-line example)
+  F. How an Unscented Kalman Filter works: sigma points
+  G. Process-model propagation (worked example)
+  H. Measurement correction and the Kalman gain (worked example)
+  I. Our three measurements in practice
+  J. Time: timestamps, duplicates, late samples, wrap-around
+  K. Starting, losing and recovering the estimate
+  L. Why the current model is temporary, and how to replace it
+  M. How the output connects to future safety algorithms
+  N. Code tour: the important classes and functions
+  O. What the simulations showed (actual values) and the limits
+  P. How to explain and defend the design in a capstone review
+
+
+A. WHY ALTITUDE ESTIMATION NEEDS FILTERING
+-------------------------------------------
+A paraglider pilot cares about two numbers: how high am I, and how fast am I
+going up or down. No single sensor gives both well.
+
+  Barometer (BMP585 x 2)  measures pressure -> altitude. No drift over
+                          seconds, but noisy: on a worn device, airflow and
+                          body movement add tens of centimetres of jitter,
+                          and weather slowly shifts it. Differentiating a
+                          noisy altitude to get speed amplifies the noise.
+  Accelerometer (via the attitude estimator)
+                          measures vertical acceleration 100 times a second
+                          with little delay. But it says nothing about
+                          altitude or speed directly. Integrating it twice
+                          turns any small bias into a growing error: a bias
+                          of 0.1 m/s^2 becomes 5 m of altitude error after
+                          10 s.
+  GNSS (NEO-M9N)          gives vertical velocity at a few Hz, with its own
+                          noise and delay, and only when the sky is visible.
+
+Filtering means combining them so that each covers the others' weakness:
+the accelerometer gives quick response, the barometer stops the drift, and
+GNSS (when present) anchors the velocity. The filter also has to say how
+sure it is, because a safety system must not act on a number it cannot
+trust.
+
+
+B. WHAT A "STATE" IS
+---------------------
+The state is the smallest set of numbers that describes "where things are
+now" well enough to predict the near future. Ours is
+
+    x = [ h , vz , az ]
+          |    |    +-- vertical acceleration, m/s^2, positive UP, gravity removed
+          |    +------- vertical velocity, m/s, positive UP
+          +------------ altitude, m, RELATIVE to where the barometers were calibrated
+
+In code this is pg::VerticalStateVec, a nav::Vec<3> (three floats). The
+index names live in NavigationTypes.hpp:
+
+    namespace vstate {
+    constexpr unsigned kAltitude = 0u;
+    constexpr unsigned kVelocity = 1u;
+    constexpr unsigned kAcceleration = 2u;
+    }
+
+"Relative" matters: h = 0 is the take-off reference, not the ground under
+you. Terrain clearance will come from the LiDAR, separately.
+
+
+C. WHAT COVARIANCE REPRESENTS
+------------------------------
+Next to the state, the filter keeps a 3 x 3 matrix P, the covariance:
+
+    P = [ var(h)       cov(h,vz)    cov(h,az)  ]
+        [ cov(vz,h)    var(vz)      cov(vz,az) ]
+        [ cov(az,h)    cov(az,vz)   var(az)    ]
+
+* The diagonal holds variances. Their square roots are the standard
+  deviations ("sigma") that the output reports: altitudeSigma_m,
+  velocitySigma_mps, accelSigma_mps2. Roughly 2 out of 3 errors should be
+  smaller than 1 sigma, and 19 out of 20 smaller than 2 sigma, IF the
+  filter's assumptions are right (section O shows when they are not).
+* The off-diagonal terms say how errors are linked. Example: if the
+  velocity estimate is too high, the altitude estimate (built from that
+  velocity) is probably too high as well, so cov(h,vz) > 0. This link is
+  why a barometer reading, which measures only h, can also correct vz.
+
+A covariance must be symmetric and "positive definite" (every variance
+positive, and no combination of errors with negative variance). The code
+checks this with a Cholesky factorisation (section F).
+
+
+D. WHY MEASUREMENT NOISE MATTERS
+---------------------------------
+Each measurement comes with a noise variance R. It is the filter's belief
+about how wrong the sensor usually is. It decides how much the estimate
+moves when a reading disagrees with it:
+
+* R small: "the sensor is precise", so the estimate jumps toward the reading.
+* R large: "the sensor is rough", so the estimate moves only a little.
+
+Getting R wrong has consequences:
+
+* R too small makes the filter nervous and over-confident. In the sweep,
+  barometer sigma 0.25 m made it reject 79 good samples.
+* R too large makes it sluggish.
+
+Our values are in NavigationConfig.hpp:
+
+    baroSigma_m     = 0.7f;    // voted barometric altitude, 1 sigma
+    accelSigma_mps2 = 0.35f;   // vertical acceleration, 1 sigma
+
+R = sigma^2, so R = 0.49 m^2 for the barometer and 0.1225 (m/s^2)^2 for the
+accelerometer.
+
+
+E. HOW A KALMAN FILTER WORKS
+-----------------------------
+A Kalman filter repeats two steps.
+
+  1. PREDICT: move the state forward in time with a model, and let the
+     covariance GROW, because the model is not perfect.
+  2. UPDATE: when a measurement arrives, compare it with what the state
+     predicts. The difference is the INNOVATION, nu = z - z_predicted.
+     Move the state by a fraction of it: x = x + K * nu. The fraction K
+     (the Kalman gain) is large when the state is uncertain and the
+     sensor is good, and small the other way round. Then SHRINK the
+     covariance, because we learned something.
+
+One-line intuition with real numbers (they reappear in section H):
+
+* The prediction says the altitude is 99.98 m with variance 0.25.
+* The barometer says 99.60 m with variance 0.49.
+
+The best blend weights each by the other's uncertainty:
+
+    K = 0.25 / (0.25 + 0.49) = 0.338
+    h = 99.98 + 0.338 * (99.60 - 99.98) = 99.85 m
+    new variance = (1 - 0.338) * 0.25 = 0.165
+
+The new variance is smaller than both 0.25 and 0.49: two imperfect
+sources together beat either alone. Everything else is this idea, done
+with matrices so that all three state variables move together.
+
+
+F. HOW AN UNSCENTED KALMAN FILTER WORKS: SIGMA POINTS
+------------------------------------------------------
+The ordinary Kalman filter needs the model written as a matrix (linear).
+A future paraglider model will not be linear: sink rate depends on airspeed
+squared, bank angle, and so on.
+
+The UNSCENTED Kalman filter handles nonlinear models without writing any
+derivative. The trick:
+
+  1. Pick 2n+1 = 7 carefully placed points around the current estimate,
+     the SIGMA POINTS. Their spread matches the covariance exactly.
+  2. Push EACH point through the real model, however nonlinear.
+  3. Recompute a mean and covariance from where the 7 points landed.
+
+How the points are placed (UnscentedKalmanFilter::makeSigma):
+
+    P = L * L^T              (Cholesky: L is a "square root" of P)
+    X0 = x
+    X(i)   = x + sqrt(c) * column i of L     i = 1..3
+    X(i+3) = x - sqrt(c) * column i of L
+    c = alpha^2 * (n + kappa) = 1 * (3 + 0) = 3,   so sqrt(c) = 1.732
+
+The weights:
+
+    Wm0 = 0,  Wc0 = 2,  Wi = 1/6 for the other six
+
+(alpha = 1, beta = 2, kappa = 0; design section 7 explains why. This beta is
+NOT the Madgwick gain.)
+
+Worked example (actual output of the code). Start with
+
+    x = [100 m, -1 m/s, 0.5 m/s^2]
+    P = diag(0.25, 0.04, 0.09)      (sigmas 0.5 m, 0.2 m/s, 0.3 m/s^2)
+
+Then L = diag(0.5, 0.2, 0.3), and sqrt(c) * L = diag(0.866, 0.346, 0.520).
+The 7 sigma points are:
+
+    X0 = [100.000  -1.000   0.500 ]
+    X1 = [100.866  -1.000   0.500 ]     X4 = [ 99.134  -1.000   0.500 ]
+    X2 = [100.000  -0.654   0.500 ]     X5 = [100.000  -1.346   0.500 ]
+    X3 = [100.000  -1.000   1.020 ]     X6 = [100.000  -1.000  -0.020 ]
+
+Their weighted mean is exactly x, and their weighted spread is exactly P.
+The test nav_sigma_points_reproduce_mean_and_covariance checks this.
+
+If P is not positive definite, Cholesky fails, the filter cannot draw
+points, and the code reports CovarianceNotPositiveDefinite instead of
+continuing with garbage.
+
+
+G. PROCESS-MODEL PROPAGATION (WORKED EXAMPLE)
+----------------------------------------------
+The process model says how the state moves in dt seconds. Today it is the
+placeholder ConstantAccelerationModel (ConstantAccelerationModel.cpp):
+
+    out[kAltitude]     = h + vz*dt + 0.5f*az*dt*dt;
+    out[kVelocity]     = vz + az*dt;
+    out[kAcceleration] = az;
+
+That is school physics with constant acceleration over a short dt. Because
+real acceleration does change, the model adds PROCESS NOISE Q(dt): "after
+dt, I am this much less sure". Two parts:
+
+  * qj = 3 m^2/s^5, white JERK: acceleration wanders randomly. Over 1 s
+    without measurements the az sigma grows by sqrt(3) = 1.7 m/s^2.
+  * qa = 0.02 m^2/s^3, unmodelled acceleration on h and vz: errors the az
+    state cannot contain (accelerometer bias, attitude error, model error).
+    Section O explains why this second term turned out to be essential.
+
+For dt = 20 ms (one barometer period), the code computes
+
+    Q(0.02) = [ 0.00000005  0.000004  0.000004 ]
+              [ 0.000004    0.000408  0.000600 ]
+              [ 0.000004    0.000600  0.060000 ]
+
+  (e.g. Q[1][1] = qj*dt^3/3 + qa*dt = 3*0.000008/3 + 0.02*0.02 = 0.000408)
+
+The engine (UnscentedKalmanFilter::predict) pushes all 7 sigma points
+through propagate(), averages them and adds Q:
+
+    x- = [ 99.980103  -0.990000  0.500000 ]
+
+which is h = 100 - 1*0.02 + 0.5*0.5*0.0004 = 99.9801 and
+vz = -1 + 0.5*0.02 = -0.99, as expected, and
+
+    P- = [ 0.250017  0.000805  0.000023 ]
+         [ 0.000805  0.040444  0.002400 ]
+         [ 0.000023  0.002400  0.150000 ]
+
+Notice two things:
+
+* var(az) grew from 0.09 to 0.15. Most of that is Q's 0.06: the model
+  is unsure about future acceleration.
+* cov(h,vz) is no longer zero: a velocity error now implies an altitude
+  error.
+
+Because this model is linear, the UKF result must equal the textbook Kalman
+filter's F*P*F^T + Q. The tests check that against an independent
+double-precision filter (Tests/sim/LinearKalmanReference.hpp). For one
+update they agree to within about 1e-6, and over 20 000 mixed steps to
+within 1.5e-4 sigma.
+
+
+H. MEASUREMENT CORRECTION AND THE KALMAN GAIN (WORKED EXAMPLE)
+---------------------------------------------------------------
+Every measurement here observes ONE state variable directly:
+
+    barometer         z = h     (index 0)
+    GNSS velocity     z = vz    (index 1)
+    acceleration      z = az    (index 2)
+
+In code this is a tiny lambda in VerticalNavigationEstimator::processCandidate:
+
+    const auto h = [idx](const VerticalStateVec& x) {
+        nav::Vec<1> z{};
+        z[0] = x[idx];
+        return z;
+    };
+
+The engine works in two halves on purpose:
+
+  evaluate()  computes everything WITHOUT changing the state:
+                z_hat = predicted measurement
+                nu    = z - z_hat                        (innovation)
+                S     = predicted spread of z + R       (innovation variance)
+                Pxz   = how each state variable co-varies with z
+                NIS   = nu^2 / S                         (surprise score)
+  apply()     commits:  K = Pxz / S,  x = x + K*nu,  P = P - K*S*K^T
+
+The split lets the estimator GATE: if NIS is absurdly large (a spike, a
+fault), it can refuse the sample before anything changes.
+
+Worked barometer update (continuing from G; z = 99.6 m, R = 0.7^2 = 0.49):
+
+    z_hat = 99.980103      nu = -0.380104
+    S     = 0.740019       NIS = 0.195       (well inside the 4-sigma gate: 16)
+    K     = [0.337855  0.001088  0.000030]
+
+    x+ = [ 99.851685  -0.990413  0.499988 ]
+    var(h): 0.250 -> 0.166
+
+The altitude moved a third of the way to the barometer (K = 0.338, as in
+the one-line example in E). Velocity and acceleration barely moved: the
+barometer is weakly linked to them so far.
+
+Worked acceleration update (z = 0.8 m/s^2, R = 0.35^2 = 0.1225):
+
+    nu = 0.300012     S = 0.272500
+    K  = [0.000055  0.008807  0.550459]
+
+    x+ = [ 99.851700  -0.987771  0.665132 ]
+    var(az): 0.150 -> 0.067
+
+Here K for az is 0.55: the filter was unsure about acceleration (variance
+0.15) and the accelerometer is good, so az moves more than half way. vz
+also moves slightly through cov(vz,az).
+
+The covariance always SHRINKS in an update. That is why the model must
+add Q in the predict step, or the filter would end up 100 % sure of
+everything.
+
+
+I. OUR THREE MEASUREMENTS IN PRACTICE
+-------------------------------------
+I.1 Barometer: each sample once, two barometers count once
+  Preprocessing publishes a "voted" altitude (the mean of the two BMP585s
+  if they agree) in EVERY 10 ms frame, but each barometer only measures
+  every 20 ms, and the two are read in different cycles. If the filter used
+  the vote every time its timestamp changed, it would use each barometer
+  sample twice and believe it had more information than it does.
+  BaroSampleTracker::classify() therefore accepts a vote only when EVERY
+  contributing barometer has a sample newer than the one used last time:
+
+    for each contributing barometer j:
+        d = diffMs(channelTimestamp[j], lastUsed[j])
+        if (d < 0) return OutOfOrder;
+        if (d == 0) anyOld = true;
+    return anyOld ? NotNew : New;
+
+  Result: one observation every 20 ms, from two fresh samples. The test
+  counts exactly 100 in 2 s, and 1 500 in 30 s through the real voter.
+  If the two barometers disagree, preprocessing says Ambiguous and the
+  filter skips the sample. It never guesses which one is right.
+
+I.2 Vertical acceleration: from the attitude estimator, quality-aware
+  The attitude estimator (Madgwick) already removed gravity:
+  AttitudeEstimate::linearAccel.vertical_mps2. The navigation code never
+  subtracts g again. It is used as a MEASUREMENT of az, never as a
+  hidden input to the prediction, so it is used once, in one place.
+  If the attitude is in doubt, the noise is inflated (classifyAccel):
+
+    not reliable / Madgwick recovering ...... x3
+    Madgwick turn gate active ............... x1.5
+    no Madgwick accel correction for long ... x3
+    IMU vote degraded ....................... x1.5
+    total above 10, or a gyro gap ........... rejected
+
+  These factors are reasonable guesses, NOT statistically calibrated. An
+  invalid acceleration is never fed as 0: the sample is simply absent.
+
+I.3 GNSS vertical velocity (optional)
+  NAV-PVT reports velD, positive DOWN. The driver (NeoM9n.cpp line 68)
+  already flips it:  verticalVelocity_mps = -velD * 0.001. So everything
+  downstream is positive UP. The filter uses it only with a 3-D fix, at
+  least 6 satellites, and a sensible speed accuracy (sAcc), with
+  sigma = max(1.5 * sAcc, 0.15 m/s). GNSS ALTITUDE is not used: it is
+  measured from sea level, while h is relative to the barometer reference.
+  Mixing them would need an extra offset estimate.
+  Without GNSS everything still works (the S21 test runs both ways).
+
+
+J. TIME: TIMESTAMPS, DUPLICATES, LATE SAMPLES, WRAP-AROUND
+-----------------------------------------------------------
+The filter has its own clock, the "filter time" t_f: the moment the state
+describes. For each new sample:
+
+  sample newer than t_f    -> predict from t_f to the sample time, then update
+  sample = previous one    -> NotNew, skipped (republished frame)
+  sample older than the previous sample of the same sensor -> OutOfOrder, skipped
+  sample after "now"       -> FutureTimestamp, skipped
+  sample a little older than t_f (<= 30 ms; GNSS <= 300 ms)
+                           -> applied, with R made LARGER by how much the
+                              state can change in that gap (never treated
+                              as current)
+  older than that          -> TooLate, skipped
+
+Within one frame, samples are sorted by time first, so a 50 Hz barometer
+and a 100 Hz accelerometer interleave correctly.
+
+Wrap-around: HAL_GetTick() wraps to 0 after 49.7 days. All comparisons use
+the signed difference (int32_t)(a - b), which stays correct across the
+wrap. The test runs the same flight once at normal times and once across
+0xFFFFFFFF, and gets bit-identical results.
+
+No new data for 50 ms: the filter predicts to "now" anyway, so its
+uncertainty grows honestly during an outage.
+
+
+K. STARTING, LOSING AND RECOVERING THE ESTIMATE
+------------------------------------------------
+States (NavState):
+
+  Uninitialized -> no barometer yet (e.g. during the 5 s calibration)
+  Initializing  -> collecting 0.5 s of barometer samples
+  Tracking      -> normal
+  Degraded      -> no barometer or no acceleration accepted for 0.5 s
+  Recovering    -> barometer back after an outage; 10 good samples to confirm
+  Unavailable   -> nothing for 3 s, no barometer for 20 s, or altitude
+                   sigma > 50 m; outputs NaN; restarts when data return
+  NumericalFault-> the engine refused a result; outputs NaN for that update,
+                   keeps the fault code, restarts
+
+Start-up in flight: the filter does NOT assume you are standing still.
+tryFitAndStart() fits a straight line through 0.5 s of barometer samples:
+
+* the line's height is the starting h;
+* its slope is the starting vz;
+* the fit's own standard errors become the starting uncertainty (never
+  below 0.3 m and 0.3 m/s).
+
+Simulation, starting at -3 m/s: valid after 0.52 s, velocity error +0.29
+m/s with sigma 0.87 m/s.
+
+Recovery from a persistent disagreement: if every barometer sample has
+been rejected for 2 s (for example both barometers jumped by 15 m), the
+filter concludes it is the one that is wrong. It inflates the altitude
+variance by nu^2 and the velocity variance by (nu/T)^2, then accepts the
+sample, so the estimate moves to it smoothly. This is counted and
+reported. The trade-off: a fault that hits both barometers equally is
+followed after 2 s.
+
+Numerical faults: the engine checks every result (finite numbers, and a
+covariance that passes Cholesky) BEFORE storing it. On failure it keeps the
+old state and returns a reason. The estimator publishes NaN, raises
+navflag::NumericalFault, records lastFaultCode, and restarts from the next
+barometer window. Nothing is silently "fixed".
+
+
+L. WHY THE CURRENT MODEL IS TEMPORARY, AND HOW TO REPLACE IT
+-------------------------------------------------------------
+Constant acceleration is not paraglider physics. A real wing has a sink
+polar (sink rate vs airspeed), sinks faster when banked, and flies in
+moving air. Nobody has built that model for ParaGuardian yet: the
+repository was searched and has no polar, no coefficients and no data
+(design section 3). The placeholder works now because the acceleration is
+MEASURED 100 times a second. The model only has to bridge 10 ms gaps, and
+it says so in every output (navflag::ModelPlaceholder).
+
+The replacement boundary is IVerticalProcessModel.hpp:
+
+    class IVerticalProcessModel {
+    public:
+        virtual ProcessModelInfo info() const = 0;
+        virtual VerticalStateVec propagate(const VerticalStateVec& x, float dt_s,
+                                           const ProcessModelInput& u) const = 0;
+        virtual void processNoise(float dt_s, const VerticalStateVec& x,
+                                  const ProcessModelInput& u, VerticalCov& Q) const = 0;
+        virtual bool parametersValid() const = 0;
+    protected:
+        ~IVerticalProcessModel() = default;
+    };
+
+To replace the model:
+
+  1. Write class MyWingModel final : public IVerticalProcessModel. propagate()
+     may be as nonlinear as you like: the UKF never needs its derivative.
+     Read bank angle etc. from ProcessModelInput u.
+  2. In SensorProcessingTask.hpp, change the type of navModel_ (one line).
+  3. Run the host tests and add tests for the new model.
+
+The engine, the estimator, the sensors and every consumer stay unchanged.
+This is shown by a test (nav_process_model_swap_with_nonlinear_mock_model)
+that runs the same estimator with a deliberately different, nonlinear
+"drag" model.
+
+Honest limit: this interface has exactly 3 states. A model that needs
+airspeed, wind or a barometer-bias state needs a bigger state. The ENGINE
+already handles that (it is a template on N, and a test runs N = 4), but
+the interface, the estimator's bookkeeping and the config would change.
+Design section 6.3 lists exactly what.
+
+
+M. HOW THE OUTPUT CONNECTS TO FUTURE SAFETY ALGORITHMS
+-------------------------------------------------------
+Every update produces a pg::NavigationEstimate (NavigationTypes.hpp), which
+SensorProcessingTask publishes into a NavigationMailbox. A future flight-
+state detector, landing guide or crash detector reads it like this:
+
+    pg::NavigationEstimate e;
+    if (SensorProcessingTask::Inst().navigation().read(e) && e.sequence != lastSeq) {
+        lastSeq = e.sequence;
+        if (e.velocityValid && e.verticalVelocity_mps + 2.0f * e.velocitySigma_mps < -6.0f) {
+            // descending faster than 6 m/s even allowing for 2 sigma of error
+        }
+    }
+
+The rules:
+
+* Use a value only if its *Valid flag is set. Invalid values are NaN, never 0.
+* Use the sigmas to decide how sure you are.
+* Check state and qualityFlags.
+* Never look inside the UKF or the model. NavigationEstimate::estimator and
+  processModel say what produced the numbers, for logs only.
+
+Because of this, swapping the model or falling back to the barometer-only
+estimator (BaroAlphaBetaEstimator, which fills the same struct) needs no
+change in the safety code.
+
+For bring-up, HealthMonitorTask copies the key fields into g_systemHealth.
+Watch it in STM32CubeIDE Live Expressions:
+
+    navState, navAltitude_cm, navVerticalVelocity_mmps, navAltitudeSigma_cm,
+    navBaroAccepted, navRecoveries, navNumericalFaults, ...
+
+
+N. CODE TOUR: THE IMPORTANT CLASSES AND FUNCTIONS
+--------------------------------------------------
+NavMath.hpp
+  Mat<R,C>, Vec<N>: fixed-size arrays, no heap. cholesky() returns false
+  instead of producing NaN when a matrix is not positive definite.
+  spdInverse() inverts S through Cholesky (for our 1 x 1 S it is just 1/S).
+
+UnscentedKalmanFilter.hpp  (template on the state size N)
+  configure(params)   computes the weights; refuses alpha <= 0 or n+kappa <= 0
+  initialize(x, P)    refuses a P that fails Cholesky
+  predict(model, dt, u)    sigma points -> model -> mean/cov + Q -> commit()
+  evaluate(z, R, h, out)   innovation, S, Pxz, NIS; changes nothing
+  apply(innovation)        x += K nu; P -= K S K^T; commit()
+  commit()            the gatekeeper: finite? Cholesky OK? only then store
+  Why "Y0 + sum W (Yi - Y0)" in weightedMean(): it avoids subtracting two
+  large numbers at 1000 m altitude in float.
+
+ConstantAccelerationModel.cpp
+  propagate() and processNoise() as in section G. fromConfig() builds it
+  from NavigationConfig so every caller uses the same noise.
+
+BaroSampleTracker.hpp
+  The "is this vote new?" rule of section I.1. It is shared by the UKF and
+  the baseline, so both use every barometer sample exactly once.
+
+VerticalNavigationEstimator.cpp
+  update()             one call per frame: classify -> sort by time ->
+                       initialise or process -> idle predict -> state ->
+                       output
+  classifyBaro/Accel/Gnss()   decide NEW? usable? which noise? (no maths)
+  initializationStep() / tryFitAndStart()   the 0.5 s line fit of section K
+  processCandidate()   predict to the sample time, late-sample inflation,
+                       evaluate, gate, recovery, apply, bookkeeping
+  updateState()        Tracking / Degraded / Recovering / Unavailable
+  finalize()           fills NavigationEstimate; NaN when not tracking
+  numericalFault()     report, clear, restart (counters survive)
+
+NavigationInputAdapter.hpp
+  navigationInputFrom(frame, attitude): copies fields, no maths. It is kept
+  separate so the tests can drive the estimator with hand-made inputs.
+
+BaroAlphaBetaEstimator.cpp
+  The barometer-only comparison filter. Its gains are the steady-state
+  Kalman gains for the actual dt (a test checks them against the Riccati
+  equation).
+
+SensorProcessingTask.cpp  (the only firmware change in the loop)
+    navigation_.update(pg::navigationInputFrom(work_, attitude_.latest()));
+    navigationOut_.publish(navigation_.latest());
+
+
+O. WHAT THE SIMULATIONS SHOWED (ACTUAL VALUES) AND THE LIMITS
+--------------------------------------------------------------
+All of this is simulation with an independent "truth" generator
+(Tests/sim/VerticalSimulator.hpp) that does NOT use the filter's model.
+Full tables: VERTICAL_UKF_VALIDATION_REPORT.md.
+
+Good:
+  * Thermal-like lift cycles: velocity RMSE 0.129 m/s (UKF) vs 0.546
+    (barometer-only).
+  * Climb turning into descent: the UKF's velocity crosses the midpoint
+    40 ms after the truth; the barometer-only filter takes 410 ms.
+  * 30 minutes: uncertainty steady (sigma_h 0.130 -> 0.131 m), no
+    numerical faults.
+  * Duplicates, out-of-order frames and timer wrap-around: results
+    identical to clean runs.
+  * Real preprocessing + real Madgwick + UKF together: altitude within
+    0.134 m, velocity within 0.053 m/s on a 1 m/s^2 sinusoidal motion.
+
+Honest weaknesses:
+  * A constant accelerometer bias of 0.2 m/s^2 biases the velocity by about
+    0.27 m/s. Here the barometer-only filter is BETTER (0.222 vs 0.297 m/s
+    RMSE). Fix later: calibrate the accelerometer, or add a bias state.
+  * With realistic, time-correlated barometer errors, the altitude sigma
+    is too optimistic. Only about 72 % of errors fall inside 2 sigma
+    instead of 95 %.
+  * A slow weather drift looks exactly like a slow climb (any relative
+    barometer has this problem).
+  * Execution time on the STM32 is estimated (50-150 us per update), not
+    measured.
+
+The lesson found during development: the first version (process noise on
+jerk only) became very sure of its velocity because the accelerometer
+reports 100 times a second. With an imperfect model or a biased
+accelerometer, it ended 8 m/s wrong while claiming 4 cm/s of uncertainty,
+and it threw away the barometer readings that disagreed. Adding qa (a small
+"I might be wrong about acceleration in ways I can't see" noise on h and vz)
+fixed that. The sweep confirms qa = 0 is the worst setting.
+
+
+P. HOW TO EXPLAIN AND DEFEND THE DESIGN IN A CAPSTONE REVIEW
+------------------------------------------------------------
+Q: Why a UKF if the model is linear?
+A: Because the next model will not be linear. The UKF engine is in place,
+   verified now against an exact reference, and ready for that model,
+   without any Jacobians to derive.
+
+Q: How do you know the UKF is implemented correctly?
+A: Because the model is linear, the UKF must equal a textbook Kalman
+   filter. An independent double-precision filter with no shared code
+   agrees to about 1e-6 per update and 1.5e-4 sigma over 20 000 steps. The
+   only parameter set that disagrees (alpha = 0.001) does so for a
+   documented float-precision reason, which the test demonstrates.
+
+Q: Is the filter's uncertainty trustworthy?
+A: When the sensors behave as assumed, yes, approximately (NEES 2.25 for
+   an ideal of 3; 95.5-99.9 % of errors inside 2 sigma). With realistic
+   correlated barometer errors, no: altitude sigma is optimistic. We
+   report that rather than hide it.
+
+Q: Why not just use the barometer?
+A: We built that too (the baseline) and compared both on identical data.
+   The UKF is better in 29 of 31 scenarios, mostly whenever the
+   acceleration changes. It is worse with a large accelerometer bias, and
+   we show it.
+
+Q: What happens when a sensor fails?
+A: One barometer: carry on with the other. Both disagree: the sample is
+   skipped, never guessed. Both lost: carry on with the accelerometer,
+   uncertainty grows, Degraded, then Unavailable after 20 s. Everything:
+   Unavailable within 3 s, restart 0.5 s after data return. A numerical
+   fault: NaN out, reported, restart. Safety code always knows, through
+   state, flags and *Valid.
+
+Q: Can you change the physics later?
+A: Yes, behind one interface with a one-line change in the task. A test
+   proves it with a different nonlinear model. If the new model needs
+   more states, the engine already supports that, and the design lists
+   exactly what else changes.
+
+Q: What is NOT done?
+A: No hardware or flight data, no measured timing on the STM32, no
+   aerodynamic model, no tuning on real flights, no GNSS altitude, no
+   LiDAR, and none of the safety logic that will use this output.
