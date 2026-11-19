@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">ParaGuardian</string>
+    <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:colorAccent">#006A5B</item>
+    </style>
+</resources>

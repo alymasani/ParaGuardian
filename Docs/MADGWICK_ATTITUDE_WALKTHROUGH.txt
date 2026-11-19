@@ -1,0 +1,782 @@
+PARAGUARDIAN - MADGWICK ATTITUDE ESTIMATION WALKTHROUGH (Milestone 3)
+=====================================================================
+
+Date: 2026-11-18
+Audience: an engineering student who knows vectors, matrices and basic
+calculus, but has not worked with quaternions or sensor fusion before.
+
+What this document is: a guided tour of the ACTUAL code in
+Components/Algorithms/Attitude/ and how it connects to the rest of the
+firmware. Every file name, function and number below refers to the code as
+it is in the repository today.
+
+What this document is NOT: evidence that the attitude estimate is correct on
+a real paraglider. Everything was tested in simulation on a laptop. Nothing
+ran on the STM32. Nothing has flown.
+
+AI-use disclosure: this code and this document were produced with AI
+assistance (Claude Code), under the student's direction, for the student's
+review. Attribute it accordingly under your university's policy.
+
+Companion documents:
+  Docs/MADGWICK_ATTITUDE_DESIGN.md        decisions, equations, parameters
+  Docs/MADGWICK_VALIDATION_REPORT.md      every measured number
+  Docs/SENSOR_PREPROCESSING_WALKTHROUGH.txt  the stage before this one
+
+Contents
+  A. What orientation means
+  B. Coordinate systems
+  C. Quaternions from first principles
+  D. Why accelerometers cannot determine yaw
+  E. Gyroscope integration and drift
+  F. How Madgwick corrections work
+  G. Accelerometer rejection
+  H. Magnetometer handling
+  I. Quaternion normalisation and numerical stability
+  J. Gravity compensation
+  K. Filter initialisation and recovery
+  L. Processing task integration
+  M. Simulated test cases with actual values
+  N. How to explain and defend the design in a capstone review
+  Appendix 1: file-by-file reference
+  Appendix 2: the journey of one IMU sample
+
+
+---------------------------------------------------------------------
+A. WHAT ORIENTATION MEANS
+---------------------------------------------------------------------
+
+"Orientation" (also "attitude") is the answer to: how is the device turned
+relative to the world? It is NOT position (where it is) and NOT velocity.
+
+Concretely we need three things for ParaGuardian:
+  1. Which way is UP, seen from the device. This gives roll and pitch, also
+     called "tilt". Without it we cannot tell the difference between "the
+     pilot is accelerating upward" and "the device is tilted so gravity
+     shows up on a different axis".
+  2. Which way is NORTH, seen from the device. This gives heading (yaw).
+     Only needed for navigation-type uses; vertical acceleration does not
+     need it.
+  3. A way to convert any vector measured by the device (acceleration,
+     magnetic field) into world coordinates.
+
+Item 3 is the real purpose. Mathematically, an orientation IS a rotation:
+the rotation that turns the device's axes into the world's axes. We store
+it as a unit quaternion (section C) and can also express it as a 3x3
+rotation matrix R or, for humans, as roll/pitch/yaw angles.
+
+The attitude filter's main product for the next milestone is the VERTICAL
+LINEAR ACCELERATION: how fast the pilot is accelerating up or down,
+with gravity removed. The future UKF combines it with the barometer.
+
+
+---------------------------------------------------------------------
+B. COORDINATE SYSTEMS
+---------------------------------------------------------------------
+
+B.1 The body frame (from Milestone 2, unchanged)
+  File: Components/Processing/AxisAlignment.hpp
+  FRD = Forward, Right, Down:
+     +x forward (where the pilot faces)
+     +y right
+     +z down
+  It is right-handed: x cross y = z (forward x right = down; use your right
+  hand: index finger forward, middle finger right, thumb points down).
+  Every vector in ProcessedSensorFrame (specificForce_mps2,
+  angularRate_radps, mag.fieldBody_uT) is in FRD.
+
+B.2 The navigation frame: ENU
+  East, North, Up:
+     +x east
+     +y north
+     +z up
+  Also right-handed (east x north = up).
+
+B.3 Why two frames that "disagree" are fine
+  FRD has z DOWN, ENU has z UP. That looks contradictory but it is not:
+  they are different frames, and the attitude quaternion is exactly the
+  rotation between them. When the device is level and faces north:
+     body +x (forward) = ENU +y (north)
+     body +y (right)   = ENU +x (east)
+     body +z (down)    = ENU -z
+  You can check this in the test att_quat_euler_matches_independent_matrix_
+  and_physical_meaning (Tests/unit/test_attitude_math.cpp), which asserts
+  exactly these three mappings.
+
+B.3a NED, and why it appears at all
+  Aerospace roll/pitch/yaw angles are traditionally defined for an FRD body
+  relative to NED (North, East, Down). We only use NED to PRINT angles that
+  pilots recognise. The relation NED <-> ENU is fixed:
+     east = NED y, north = NED x, up = -NED z
+  As a rotation this is 180 degrees about the axis halfway between north
+  and east. Its quaternion is
+     quat::kEnuFromNed = (w 0, x 0.7071, y 0.7071, z 0)
+  (Quaternion.hpp line 61). It is the same matrix as kEnuFromNed in
+  AxisAlignment.hpp (test att_quat_enu_from_ned_matches_axis_alignment_
+  matrix). It is its own inverse: doing it twice gets you back.
+
+B.4 Specific force vs gravity (the most common sign mistake)
+  An accelerometer does NOT measure gravity. It measures SPECIFIC FORCE:
+       f = a - g_vec
+  where a is the true acceleration and g_vec = (0, 0, -9.80665) in ENU.
+  Sitting still on a table: a = 0, so f = -g_vec = (0, 0, +9.80665): the
+  accelerometer reports +g UPWARD, because the table pushes up on it.
+  In FRD body axes, level, that same vector is (0, 0, -9.80665), because
+  body z points down.
+  In free fall: a = g_vec, so f = 0. The accelerometer reads zero.
+  This is why "accelerometer z" is not "vertical acceleration".
+
+
+---------------------------------------------------------------------
+C. QUATERNIONS FROM FIRST PRINCIPLES
+---------------------------------------------------------------------
+
+C.1 Why not just angles?
+  Roll/pitch/yaw are three numbers, but they have two problems:
+  - order matters (rotate about x then y is not y then x), so every formula
+    depends on a convention that is easy to get wrong;
+  - at pitch = +-90 degrees ("gimbal lock") roll and yaw become the same
+    motion and the equations divide by zero.
+  A 3x3 rotation matrix has no singularity, but it has 9 numbers that must
+  stay orthonormal (6 constraints), which drifts with rounding.
+  A unit quaternion has 4 numbers and 1 constraint (length 1). No
+  singularities, cheap to keep normalised, cheap to multiply.
+
+C.2 What a quaternion is
+  q = w + x i + y j + z k, with i^2 = j^2 = k^2 = ijk = -1 (Hamilton).
+  Stored scalar-first in struct Quaternion { float w, x, y, z; }
+  (Quaternion.hpp line 34).
+  A rotation by angle theta about unit axis u is
+       q = ( cos(theta/2),  u * sin(theta/2) )
+  See quat::fromAxisAngle (line 131). Example: 90 degrees about ENU up
+  (0,0,1): q = (0.7071, 0, 0, 0.7071). It turns east (1,0,0) into north
+  (0,1,0) (test att_quat_axis_angle_right_hand_rule).
+
+  Note the HALF angle. Two consequences:
+  - q and -q are the SAME rotation (theta and theta + 360 deg). The filter
+    keeps w >= 0 only for readability (MadgwickFilter.cpp, end of update).
+  - a correction that changes q by a small amount d changes the rotation
+    angle by about 2*d. This factor 2 appears in section F.
+
+C.3 What OUR quaternion means (memorise this sentence)
+  q = q_ENU_from_body: it takes a vector written in BODY coordinates and
+  gives the same vector written in ENU coordinates:
+       v_ENU = q (x) [0, v_body] (x) q*      ("(x)" = Hamilton product,
+                                              q* = conjugate (w, -x, -y, -z))
+  quat::rotate(q, v) (line 106) computes that efficiently:
+       t = 2 (q_v x v);   v' = v + w t + q_v x t
+  quat::toMatrix(q) (line 120) gives the equivalent matrix R(q) with
+  v_ENU = R v_body. Its COLUMNS are the body axes expressed in ENU; its ROWS
+  are the ENU axes expressed in body coordinates. Row 3 = "up" in body
+  axes. Keep that in mind for section F.
+
+  The inverse direction (ENU -> body) uses the conjugate:
+  quat::rotateInverse (line 117).
+
+C.4 Chaining
+  Frames chain like matrices: q_A_from_C = q_A_from_B (x) q_B_from_C.
+  Example used in the code: q_ENU_from_body = q_ENU_from_NED (x)
+  q_NED_from_body (quat::fromEulerNedZyx, line 146).
+  The test att_quat_hamilton_product_composes_like_matrices checks, for 200
+  random pairs, that the matrix of a(x)b equals R(a)*R(b), using a matrix
+  formula written separately in Tests/sim/AttitudeSimulator.hpp.
+
+C.5 Euler angles for display (quat::toEulerNedZyx, line 161)
+  roll  = atan2(R_NED[2][1], R_NED[2][2])
+  pitch = -asin(R_NED[2][0])      (argument clamped to [-1, 1])
+  yaw   = atan2(R_NED[1][0], R_NED[0][0])
+  with R_NED = matrix of (q_ENU_from_NED (x) q). Sequence Z-Y-X (yaw, then
+  pitch, then roll). Signs: roll + = right side down; pitch + = nose up;
+  yaw = heading clockwise from north (0 north, 90 east).
+  These are ONLY for display and diagnostics (AttitudeEstimate::eulerDeg,
+  g_systemHealth.rollCentiDeg, ...). The filter never uses them.
+
+
+---------------------------------------------------------------------
+D. WHY ACCELEROMETERS CANNOT DETERMINE YAW
+---------------------------------------------------------------------
+
+At rest the accelerometer tells you the direction of "up" in body axes:
+two angles (roll, pitch). Now spin the device about the vertical axis.
+"Up" does not change, so the accelerometer reading does not change. Every
+heading gives the same measurement: yaw is NOT OBSERVABLE from gravity.
+
+Consequences in the code:
+  - AttitudeEstimator::level() (AttitudeEstimator.cpp line 156) computes
+    roll and pitch from the averaged specific force and sets yaw = 0 (the
+    first time) or keeps the previous yaw (after a re-initialisation).
+    "Yaw 0" just means body x points to a "pseudo-north" that is wherever
+    the device was facing. The output says so: heading = Unreferenced,
+    flag HeadingUnreferenced, yawReferenced = false.
+  - In 6-axis mode (gyro + accel) yaw is only integrated from the gyro and
+    drifts with the gyro bias. Simulation S8: a 0.01 rad/s bias drifts yaw
+    by 68.5 degrees in 2 minutes while tilt stays below 0.35 degrees.
+  - Only a magnetometer (or GNSS track) can provide absolute heading.
+
+Levelling formulas (FRD body, at rest f = g*(sin th, -sin ph cos th,
+-cos ph cos th)):
+     roll  = atan2(-fy, -fz)
+     pitch = atan2(fx, sqrt(fy^2 + fz^2))
+Example: device rolled 30 degrees right, pitch 0:
+  f_body = (0, -9.80665*sin30, -9.80665*cos30) = (0, -4.903, -8.493)
+  roll = atan2(4.903, 8.493) = 30.0 degrees. Test
+  att_est_levels_roll_pitch_from_gravity_yaw_unreferenced levels at roll 30
+  / pitch -20 with realistic noise: tilt error 0.109 degrees.
+
+
+---------------------------------------------------------------------
+E. GYROSCOPE INTEGRATION AND DRIFT
+---------------------------------------------------------------------
+
+The gyroscope measures angular rate omega (rad/s) in body axes. The
+orientation changes as
+       dq/dt = 1/2 * q (x) [0, omega_body]
+The body rate multiplies on the RIGHT because it is measured in the body
+frame (test att_madgwick_pure_gyro_integration_matches_truth starts at yaw
+0.7 rad and rolls about the BODY x axis; the result matches the exact
+truth within 0.02 degrees).
+
+Discrete step (MadgwickFilter::update, MadgwickFilter.cpp line 68):
+       q_new = normalise(q + 1/2 q (x) [0, omega] * dt)
+
+Numerical example (computed with the real code):
+  start level, yaw 0:  q = (0, 0.707107, 0.707107, 0)
+  gyro (0.5, 0, 0) rad/s for dt = 0.010 s (rolling right)
+  -> q = (0.001768, -0.707105, -0.707105, 0.001768)
+     (sign flipped to keep w >= 0: same rotation)
+  roll = 0.2865 degrees = 0.5 rad/s * 0.01 s. Correct.
+
+Where dt comes from: the timestamps (section K/L), not an assumed 10 ms.
+
+Why it drifts: any error in omega (residual bias b, noise, scale factor) is
+integrated. A constant bias b gives an angle error growing as b*t. After
+the Milestone 2 calibration the simulated residual is about 2e-4 rad/s
+(0.7 degrees per minute). A real gyro whose bias moves with temperature
+can be much worse. The gyro is excellent short-term and poor long-term;
+the accelerometer (gravity) is poor short-term (noise, accelerations) and
+good long-term. Combining them is the job of the filter.
+
+
+---------------------------------------------------------------------
+F. HOW MADGWICK CORRECTIONS WORK
+---------------------------------------------------------------------
+
+Reference: S. Madgwick, "An efficient orientation filter for inertial and
+inertial/magnetic sensor arrays", 2010. File: MadgwickFilter.cpp.
+
+F.1 The idea in one sentence
+  Ask "which small change of q would make the predicted direction of
+  gravity match the measured one?", and nudge q that way at a fixed rate
+  beta, while the gyro does the fast tracking.
+
+F.2 The error function (accelGradient, line 23)
+  Predicted up in body axes = R(q)^T * (0,0,1) = third row of R:
+     ( 2(q1q3 - q0q2), 2(q0q1 + q2q3), 1 - 2q1^2 - 2q2^2 )
+  Measured up = a_hat = f / |f| (unit specific force).
+  Error vector f_g = predicted - measured (3 numbers).
+  We want to minimise E = 1/2 |f_g|^2 over q. Its gradient with respect to
+  the four quaternion numbers is J^T f_g, where J is the 3x4 matrix of
+  partial derivatives (the Jacobian) written out in the code:
+     J_g = [[-2q2,  2q3, -2q0, 2q1],
+            [ 2q1,  2q0,  2q3, 2q2],
+            [   0, -4q1, -4q2,   0]]
+
+F.3 The update
+     qdot = 1/2 q (x) [0, omega]  -  beta * grad / |grad|
+     q    = normalise(q + qdot * dt)
+  The gradient is NORMALISED, so the correction always has size beta,
+  whatever the size of the error. In rotation angle that is 2*beta rad/s
+  (the factor 2 from C.2).
+
+F.4 Worked example (real numbers from the code)
+  Truth: level. Estimate: rolled 2 degrees.
+    q          = (-0.012341, 0.706999, 0.706999, -0.012341)
+    predicted up in body = (0, -0.034899, -0.999391)
+    measured  up a_hat   = (0, 0, -1)          (f = (0, 0, -9.80665))
+    angle between them   = 2.0000 degrees      (accelErrorDeg)
+    f_g  = (0, -0.034899, 0.000609)
+    grad = (-0.049348, -0.000862, -0.000862, -0.049348), |grad| = 0.0698
+  One step, beta = 0.1 rad/s, dt = 0.01 s, gyro 0:
+    roll after = 1.8854 degrees: it moved 0.1146 degrees
+             = 2 * beta * dt = 2 * 0.1 * 0.01 rad = 0.1146 degrees. Exactly.
+
+F.5 How we know the gradient formulas are right
+  Test att_madgwick_accel_gradient_matches_finite_difference_and_vanishes_
+  at_truth: for 100 random orientations it computes the gradient by
+  numerical differentiation of an independently written error function
+  (in double precision) and compares; it also checks the gradient is zero
+  when the estimate equals the truth. Same for the magnetometer gradient.
+
+F.6 What beta does (MADGWICK_VALIDATION_REPORT.md section 6)
+  - Larger beta: cancels larger gyro errors (up to 2*beta rad/s) and
+    re-converges faster, but follows accelerometer noise and false
+    "gravity" during accelerations more.
+  - The steady-state wobble ("limit cycle") is 2*beta*dt: 0.115 degrees
+    at beta 0.1 (measured 0.115).
+  - Default beta = 0.1 rad/s (Madgwick's reference default). The earlier
+    proposal 0.5 is NOT used: 5x the wobble, 2.4x the noise, no benefit in
+    any simulated case. This is NOT the same number as the "gain 0.5" of
+    the Fusion library, which is a different update law (design doc 2.1).
+  - Nothing proves 0.1 is optimal for paragliding; it must be tuned on
+    recorded flight data.
+
+
+---------------------------------------------------------------------
+G. ACCELEROMETER REJECTION
+---------------------------------------------------------------------
+
+The correction in F assumes the accelerometer measures only gravity. In
+flight it also measures turns, turbulence and pitch changes. A correction
+using those would tilt the estimate. So AttitudeEstimator::decideAccel
+(AttitudeEstimator.cpp line 223) checks, in this order:
+
+  1. Valid and fresh?           else Unavailable
+  2. | |f| - g | <= 1.0 m/s^2?   else RejectedMagnitude (free fall: |f| ~ 0)
+  3. |omega| <= 0.10 rad/s?     else RejectedRotation ("turn gate")
+  4. angle(a_hat, predicted up) <= 10 degrees?  else RejectedDirection
+     (unless the recovery rule applies, section K)
+
+Rejected means: this step is gyro-only (beta 0). The estimate keeps
+propagating; nothing is reset.
+
+G.1 Why the magnitude test alone is not enough
+  In a coordinated turn at bank phi the pilot feels g/cos(phi) along the
+  seat: |f| = 10.15 m/s^2 at 15 degrees, only 0.34 above g, which passes.
+  But its direction is tilted by phi from true vertical.
+
+G.2 Why the angle test alone is not enough (a finding of this milestone)
+  In a coordinated turn, specific force is ALWAYS along body -z (that is
+  what "coordinated" means: no sideways force). If the estimate is right,
+  the angle test sees the bank angle and rejects. But during a gradual
+  roll-in, while the bank is still under 10 degrees, every accepted step
+  pulls the estimate toward "wings level"; the estimate then never sees a
+  big error, and the gate never triggers. Simulation (validation report
+  7.1): with any angle gate, a sustained 15-degree turn ends with the FULL
+  15-degree error.
+
+G.3 The turn gate
+  A turn at bank phi and airspeed V rotates at g*tan(phi)/V
+  (0.26 rad/s at 15 degrees and 10 m/s). Rejecting corrections while
+  |omega| > 0.10 rad/s removes most of the problem:
+     30-degree turn: 20.05 -> 1.16 degrees max tilt error
+     15-degree turn: 15.27 -> 1.63 degrees
+  What it costs (be ready to say this in a review):
+     - slower turns (< 0.10 rad/s, about 6 degrees of bank at 10 m/s)
+       still leak their whole bank angle (5-degree turn: 5.24 degrees);
+     - in turbulence corrections are accepted only ~4 % of the time, so
+       the attitude is mostly gyro-only. With a good gyro that is fine
+       (simulation), with a drifting gyro it is not (unknown until
+       hardware);
+     - the better long-term answer is to subtract the turn acceleration
+       omega x v using GNSS velocity (future milestone).
+
+G.4 Degraded state
+  If no correction has been accepted for 2 s (degradedAfterMs), the state
+  becomes Degraded and the flag AccelRejectedProlonged is set. The
+  orientation is still output, but linear acceleration is marked "valid,
+  not reliable". During the simulated 30-degree turn the estimator reports
+  Degraded, as it should.
+
+
+---------------------------------------------------------------------
+H. MAGNETOMETER HANDLING
+---------------------------------------------------------------------
+
+File: AttitudeEstimator.cpp, decideMag (line 280); MadgwickFilter
+magGradient / magReference.
+
+H.1 Why the default is "do not use it"
+  A magnetometer measures Earth's field PLUS fields from nearby metal and
+  currents (hard iron) and distortions (soft iron). Without a calibration
+  done in the final enclosure, heading from it is not trustworthy.
+  ParaGuardian has no such calibration yet: frame.mag.ironCalibrated is
+  always false. The default policy MagPolicy::CalibratedOnly therefore
+  never uses it -> 6-axis, heading Unreferenced. Policies:
+     Disabled           never
+     CalibratedOnly     only if the frame says calibrated (default)
+     AllowUncalibrated  experimental; heading reported "MagneticUnvalidated"
+
+H.2 Four separate facts, four separate outputs
+  measurement valid (input magValid) / calibration valid (magCalibrated) /
+  correction accepted (magCorrection) / heading reliable
+  (heading == MagneticReferenced, yawReferenced). Never collapsed into one
+  boolean.
+
+H.3 The magnetometer Madgwick term (ENU version)
+  Madgwick's paper uses a world frame with x = north. In ENU, north is +y.
+  The reference field is rebuilt from the measurement at every step:
+     h = R(q) m_hat (measured field in ENU)
+     b = (0, sqrt(h_e^2 + h_n^2), h_u)
+  i.e. same dip angle as measured, horizontal part pointing exactly north.
+  The error R(q)^T b - m_hat then only "sees" heading error (mostly). The
+  Jacobian was derived for this ENU form (design doc 4.3) and verified by
+  finite differences.
+
+H.4 Gates
+  1. |m| outside 20..70 uT -> RejectedMagnitude
+  2. Acquisition (first use after levelling): 10 DISTINCT consistent
+     samples, then ONE yaw-only rotation so the field points north. (A bug
+     caught before testing: the 50 Hz magnetometer is seen by two 100 Hz
+     gyro steps, so the counter must only count new timestamps.)
+  3. Strength changed > 15 % or dip changed > 10 degrees -> rejected
+     (typical magnetic disturbance signatures)
+  4. Heading disagreement > 10 degrees -> rejected; if the disagreement is
+     self-consistent and lasts 5 s -> accepted with the recovery gain.
+  5. Only applied in steps where the accelerometer was ALSO accepted (the
+     magnetometer gradient can tilt roll/pitch when the field dips).
+
+H.5 Results (validation report section 8)
+  acquisition error 0.417 degrees; 3 s 60-degree disturbance: heading error
+  never above 0.333 degrees; single wild sample: < 0.2 degrees movement.
+  Honest trade-off: a PERSISTENT disturbance that keeps the same strength
+  and dip (e.g. a magnet fixed next to the sensor) is accepted after 5 s
+  and pulls the heading (42 degrees within 7 s in the test).
+  Heading is MAGNETIC, not true north (no declination applied).
+
+
+---------------------------------------------------------------------
+I. QUATERNION NORMALISATION AND NUMERICAL STABILITY
+---------------------------------------------------------------------
+
+Only a unit quaternion is a rotation. Adding qdot*dt makes |q| slightly
+different from 1, so every step renormalises.
+quat::normalize (Quaternion.hpp line 88):
+  - refuses non-finite input (NaN, Inf);
+  - refuses |q| <= 1e-6 (no direction information left);
+  - on refusal leaves the output untouched and returns false.
+MadgwickFilter::update returns false in that case and KEEPS the previous
+orientation (it never writes garbage into the state); the estimator counts
+a numerical fault and declares the orientation Invalid
+(AttitudeEstimator::stepTracking). Inputs are checked before use (finite
+gyro, positive finite dt and beta), so this path is not expected to occur.
+
+Precision: everything is float (single precision, hardware FPU), except the
+levelling average which accumulates in double. First-order integration
+error per 10 ms step is about theta^3/12 (3e-7 rad at 180 deg/s).
+
+The gravity compensator has its own policy for quaternions given to it
+(GravityCompensator.cpp): within 1 +- 0.01 -> renormalise (round-off);
+further -> reject (corruption must not be "fixed" silently).
+
+Tests: att_quat_normalize_rejects_degenerate_and_scales_valid,
+att_madgwick_rejects_bad_step_and_keeps_state,
+att_gravity_unnormalized_quaternion_policy, and the "never NaN, never
+falsely healthy" monitor in every simulation scenario.
+
+
+---------------------------------------------------------------------
+J. GRAVITY COMPENSATION
+---------------------------------------------------------------------
+
+File: GravityCompensator.hpp/.cpp. One line of physics:
+       a_ENU = R(q) * f_body + (0, 0, -g)
+because f = a - g_vec  =>  a = f + g_vec, and g_vec = (0, 0, -g) in ENU.
+
+Worked example (from the real code): device rolled 30 degrees, pilot
+accelerating UP at 1 m/s^2.
+  f_body          = (0.0000, -5.4033, -9.3588)
+  R(q) * f_body   = (0, 0, 10.8066)
+  a_ENU           = (0, 0, 1.0000)        vertical +1.0000 m/s^2. Correct.
+  The naive "accelerometer z" would be -9.3588: meaningless as vertical
+  acceleration. This is why we need the attitude.
+
+Validity rules:
+  - orientation invalid, accel invalid, NaN anywhere -> valid = false and
+    the numbers are NaN, never 0 (0 would look like "no acceleration").
+  - attitude Degraded -> valid but NOT reliable (flag LinearAccelUnreliable).
+  - heading does not matter for the vertical component, so 6-axis is fine.
+
+Sensitivity (tests): 1 degree of tilt error -> 0.171 m/s^2 horizontal error,
+0.0015 m/s^2 vertical. Accelerometer bias goes straight through (not
+calibrated yet).
+
+Simulated free fall: vertical reads -9.81 within 0.054 m/s^2 for 1.5 s.
+Stationary: |a_lin| below 0.088 m/s^2. 30-degree turn: vertical error RMS
+0.060 m/s^2 (without the rejection logic: max 1.4 m/s^2).
+
+Nothing is integrated into velocity or altitude in this milestone.
+
+
+---------------------------------------------------------------------
+K. FILTER INITIALISATION AND RECOVERY
+---------------------------------------------------------------------
+
+K.1 States (AttitudeTypes.hpp line 26)
+  Uninitialized  no calibrated gyro or no accelerometer yet
+  Initializing   collecting a quasi-static window
+  Tracking6Axis  gyro + accepted gravity corrections
+  Tracking9Axis  + accepted magnetometer corrections
+  Degraded       still propagating, but corrections absent for 2 s, a gap
+                 not yet confirmed, or recovery running
+  Invalid        orientation discarded (long gap / numerical failure)
+
+K.2 Levelling (stepInit, line 104; level, line 156)
+  Needs a CONTINUOUS window of >= 500 ms and >= 40 gyro samples with
+  |omega| <= 0.10 rad/s and | |f| - g | <= 0.6 m/s^2. Any motion or a hole
+  > 50 ms restarts it. Then roll/pitch from the window's mean specific
+  force (section D), yaw 0 or the previous yaw.
+  The gyro must be bias-calibrated (Milestone 2, 5 s still at power-on).
+  If the wearer moves from power-on, the estimator stays Uninitialized and
+  says GyroNotCalibrated: no attitude is invented
+  (test att_e2e_moving_at_startup_never_fabricates_attitude).
+  "Quasi-static" includes steady straight flight, so re-levelling works in
+  the air after an Invalid.
+
+K.3 Gaps (stepTracking, line 387)
+  dt <= 50 ms        integrate normally
+  50 < dt <= 500 ms  NOT integrated (the rotation during the hole is
+                     unknown); mark GapDetected / Degraded; confirmed by the
+                     next accepted gravity correction
+  > 500 ms           Invalid; re-level when quasi-static data return
+
+K.4 Recovery (decideAccel, the part after the angle test)
+  If the estimate is far off (after a gap, or rejected for 5 s), the angle
+  gate would reject forever. Recovery FORCES corrections, with the bigger
+  gain recoveryBeta = 0.5, but ONLY if the motion has been quasi-static
+  for 1 s (|omega| <= 0.10, | |f| - g | <= 0.3). Why not just a timer
+  (Fusion style)? In a long spiral dive a timer would align "up" with the
+  centrifugal "up": an error as big as the bank angle. Requiring calm
+  evidence avoids that.
+  Test S14: gyro lost for 300 ms in the middle of a 90-degree roll ->
+  50.4 degrees error; recovery brings it under 2 degrees and back to
+  Tracking 2.97 s later.
+
+
+---------------------------------------------------------------------
+L. PROCESSING TASK INTEGRATION
+---------------------------------------------------------------------
+
+Files: Components/Tasks/SensorProcessingTask.hpp/.cpp,
+       Components/Algorithms/Attitude/AttitudeFrameAdapter.hpp,
+       AttitudeMailbox.hpp, Components/Tasks/HealthMonitorTask.cpp,
+       SystemHealth.hpp.
+
+L.1 Where it runs
+  SensorProcessingTask::Run() already did: wait for sensor messages ->
+  ingest them -> buildFrame -> publish the frame. Two lines were added:
+       attitude_.update(pg::attitudeInputFromFrame(work_));
+       attitudeOut_.publish(attitude_.latest());
+  Same task, priority 32, below the acquisition task (40), so the attitude
+  maths can never delay a sensor read. No new task, queue or stack.
+  Reasons (design doc 11.1): one frame in, one estimate out; ~25-80 us
+  estimated per update; a separate task would only add memory, copies and
+  latency.
+
+L.2 One step per NEW gyro sample
+  The task builds a frame every time it wakes, including the 50 ms idle
+  timeout when no data arrived. The estimator compares the frame's gyro
+  timestamp with the last integrated one: equal -> NotNew (nothing done),
+  older -> OutOfOrder. So repeated frames are never integrated twice
+  (tests S17 and att_e2e_republished_frames_not_integrated_twice: the final
+  quaternion is bit-for-bit identical with and without repeats).
+  Barometer, GNSS and LiDAR messages never trigger an attitude step.
+
+L.3 Reading the result from another task
+  pg::AttitudeEstimate e;
+  if (SensorProcessingTask::Inst().attitude().read(e) && e.orientationValid) {
+      // e.q, e.linearAccel (check .valid / .reliable), e.qualityFlags ...
+  }
+  read() copies under a critical section (164 bytes); the producer never
+  blocks. TSan test: 20 000 writes vs concurrent reads, no torn copy.
+
+L.4 Health
+  HealthMonitorTask copies the estimate into g_systemHealth once per
+  second: attitudeState, headingReference, accel/mag correction status,
+  roll/pitch/yaw in centi-degrees, vertical acceleration in mm/s^2,
+  counters. INT32_MIN means "not valid". Watch it in CubeIDE Live
+  Expressions.
+
+L.5 Memory and time (measured / estimated)
+  RAM +816 bytes total, heap 0, stack ~0.5 KB on the existing 4 KB stack,
+  flash +11.7 KB (Release). Host: 76 ns per update. STM32: estimated
+  25-80 us per update (NOT measured).
+
+
+---------------------------------------------------------------------
+M. SIMULATED TEST CASES WITH ACTUAL VALUES
+---------------------------------------------------------------------
+
+The simulator (Tests/sim/AttitudeSimulator.hpp) is independent of the
+production maths: truth is a double-precision rotation matrix, rotated by
+the exact Rodrigues formula every 0.5 ms; accelerometer data are generated
+as f = R^T (a + (0,0,g)), so accelerations are physical, never "tilted
+gravity". Error = 2*acos(|q_true . q_est|).
+
+Realistic sensor errors: residual gyro bias ~2e-4 rad/s, gyro noise
+0.002 rad/s, accel noise 0.02 m/s^2, mag noise 0.2 uT.
+
+  Scenario                                         Result
+  S1  still, level, 30 s                           max 0.333 deg
+  S2/3 still at roll 45/-120, pitch -30/60/75      max 0.24-0.32 deg
+  S4  90-deg roll in 1 s                           final 0.121 deg
+  S5  90-deg pitch in 1 s (gimbal lock)            final 0.076 deg
+  S6  90-deg yaw, 6-axis                           final 0.141 deg
+  S7  multi-axis (60,-40,120 deg)                  final 0.101 deg
+  S8  gyro bias 0.01 rad/s, 120 s                  tilt 0.34 deg, yaw drift 68.5 deg
+  S9  20 % samples lost + 5 % invalid accel        final 0.160 deg
+  S10 dt jitter 5-17 ms                            final 0.119 deg
+  S11 3 m/s^2 push + 3 g spike                     39 rejected, tilt 0.297 deg
+  S12 30-deg coordinated turn, 20 s                tilt max 1.16 deg (27.2 without gates)
+  S13 magnetic disturbance during 9-axis turn      heading max 0.398 deg
+  S14 300 ms gyro gap mid-roll                     50 deg -> < 2 deg in 2.97 s
+  S15 1.5 s free fall                              vertical = -g within 0.054
+  S16 10 minutes 6-axis                            tilt max 0.344 deg, yaw 4.3 deg drift
+  S17 duplicates and late samples                  bit-identical to clean run
+  E2E through the preprocessing pipeline, 90-deg roll: 0.065 deg
+
+Targets (provisional, development only): stationary < 1 deg, 90-degree
+rotation < 2 deg, stationary gravity compensation < 0.2 m/s^2: all met.
+The sustained-acceleration and turbulence cases are reported, not passed
+or failed against a single threshold.
+
+
+---------------------------------------------------------------------
+N. HOW TO EXPLAIN AND DEFEND THE DESIGN IN A CAPSTONE REVIEW
+---------------------------------------------------------------------
+
+Likely questions and short, honest answers:
+
+Q: Why Madgwick and not a Kalman filter for attitude?
+A: Madgwick is a small, well-published filter with one main tuning
+   parameter, constant cost, no matrices to invert, and good accuracy for
+   MEMS IMUs. The UKF in the next milestone handles altitude/vertical
+   speed, where explicit uncertainty matters more. Attitude errors are
+   reported through state, flags and measured simulation errors, not a
+   covariance (a known limitation of Madgwick).
+
+Q: Why not reuse Fusion from the SOAR project?
+A: The copy has no licence text, includes desktop headers, uses a
+   different (revised) update law, counts recovery in samples although our
+   dt varies, and the SOAR review found gravity-handling bugs around it.
+   The original algorithm is ~150 lines and was verified line by line.
+
+Q: How do you know the signs are right?
+A: Independent checks, not "tune until green": level rest maps to +g up in
+   ENU; yaw +90 points body x east; nose-up pitch gives an up component;
+   gradients match finite differences; the simulator is a separate double-
+   precision matrix implementation; and a simulator sign bug (identity =
+   upside down) was caught BY the filter levelling to roll 180 degrees.
+
+Q: What happens in a thermal (long turn)?
+A: The turn gate stops accelerometer corrections, so the tilt is held by
+   the gyro alone; the state shows Degraded after 2 s. With the simulated
+   gyro the error stays near 1 degree; with a real drifting gyro it would
+   grow at the bias rate. Slow, shallow turns below 0.10 rad/s still leak.
+   The planned fix is centripetal compensation with GNSS velocity.
+
+Q: Why is beta 0.1?
+A: Sweep: noise grows with beta, drift cancellation needs 2*beta > gyro
+   error, acceleration sensitivity grows with beta without gates. 0.1 keeps
+   margin for real gyro errors that the simulation does not model. Not
+   tuned for paragliding; flight data needed.
+
+Q: Can the output lie?
+A: It is designed to say when it cannot be trusted: NaN + invalid flags
+   when there is no orientation, Degraded when corrections are missing,
+   "valid but not reliable" linear acceleration, unreferenced heading
+   without a calibrated magnetometer, and inherited flags such as
+   MountingUnverified. It can still be wrong in ways it cannot detect
+   (sustained slow turns, persistent magnetic disturbances, bias drift).
+
+Q: Is it real-time on the STM32?
+A: Estimated 25-80 us per 10 ms frame (< 1 %), static memory only, no
+   blocking, in the existing processing task below acquisition priority.
+   Not measured on hardware yet; a GPIO-toggle measurement is planned.
+
+Q: What is NOT done?
+A: Hardware tests, mounting verification, magnetometer calibration, gyro
+   bias over temperature, in-flight restart handling, centripetal
+   compensation, UKF, crash detection, landing guidance, SOS.
+
+
+---------------------------------------------------------------------
+APPENDIX 1: FILE-BY-FILE REFERENCE
+---------------------------------------------------------------------
+
+Components/Algorithms/Attitude/Quaternion.hpp
+  Purpose: quaternion type and all quaternion maths; THE convention.
+  Key functions: multiply, conjugate, normalize, rotate, rotateInverse,
+  toMatrix, fromAxisAngle, fromEulerNedZyx, toEulerNedZyx, angleBetween.
+  Inputs/outputs: plain values, no state. Memory: none. Time: constant.
+  Tests: att_quat_* (10 tests). Limitation: Euler degenerate at +-90 pitch.
+
+Components/Algorithms/Attitude/MadgwickFilter.hpp/.cpp
+  Purpose: one Madgwick step; holds only q (16 bytes).
+  update(gyro, accelUnit*, magUnit*, beta, dt) -> bool.
+  accelGradient / magGradient / magReference exposed for tests.
+  Errors: rejects non-finite input, dt <= 0; keeps q on failure.
+  Tests: att_madgwick_* (5).
+
+Components/Algorithms/Attitude/AttitudeEstimator.hpp/.cpp
+  Purpose: everything around the filter: state machine, dt, gaps, gates,
+  recovery, magnetometer policy, output assembly.
+  update(AttitudeInput) once per frame; latest() returns the estimate.
+  Memory: 424 bytes, member of SensorProcessingTask, lives forever.
+  Functions: stepInit, level, invalidate, stepTracking, updateQuiet,
+  decideAccel, decideMag, finalize.
+  Tests: att_est_* (14), att_mag_* (8), att_sim_* (17), att_e2e_* (5).
+
+Components/Algorithms/Attitude/GravityCompensator.hpp/.cpp
+  Purpose: a_ENU = R f + (0,0,-g). Stateless except g.
+  Tests: att_gravity_* (9).
+
+Components/Algorithms/Attitude/AttitudeConfig.hpp
+  Purpose: every tunable number + isValid(). Invalid config disables the
+  estimator (flag InvalidConfig); the firmware asserts at start-up.
+
+Components/Algorithms/Attitude/AttitudeTypes.hpp
+  Purpose: AttitudeState, HeadingReference, GyroIntegration,
+  CorrectionStatus, attitude::* flags, AttitudeInput, LinearAcceleration,
+  AttitudeEstimate (164 bytes, trivially copyable).
+
+Components/Algorithms/Attitude/AttitudeFrameAdapter.hpp
+  Purpose: field mapping ProcessedSensorFrame -> AttitudeInput.
+  Test: att_frame_adapter_maps_fields.
+
+Components/Algorithms/Attitude/AttitudeMailbox.hpp
+  Purpose: latest-value hand-over (critical section copy).
+  Test: att_mailbox_concurrent_reads_are_consistent (TSan).
+
+Tests/sim/AttitudeSimulator.hpp
+  Purpose: independent truth + sensor model + error metrics.
+
+
+---------------------------------------------------------------------
+APPENDIX 2: THE JOURNEY OF ONE IMU SAMPLE
+---------------------------------------------------------------------
+
+t = 7.000 s. The pilot is level and starts climbing at +0.5 m/s^2.
+
+1. SensorAcquisitionTask (priority 40) reads the three LSM6DSRX over SPI.
+   Each driver converts to SI units and stamps the read-completion time,
+   e.g. IMU0 at 7000 ms: gyro (0.0120, -0.0201, 0.0061) rad/s (mostly its
+   bias), accel (0.003, -0.011, -10.307) m/s^2 (= -(g + 0.5) on body z).
+   It publishes SensorMessages into the SensorDataHub, which copies them
+   into SensorProcessingTask's queue (DropOldest). The acquisition task
+   never waits.
+2. SensorProcessingTask (priority 32) wakes once the acquisition cycle
+   blocks, and ingests every queued message (Milestone 2): validation,
+   bias subtraction (calibrated earlier), alignment to FRD, 3-IMU voting.
+   buildFrame() produces angularRate_radps ~ (0.0002, -0.0001, 0.0001)
+   rad/s with timestampMs 7000 and specificForce ~ (0.00, -0.01, -10.31).
+3. attitudeInputFromFrame() copies these fields into an AttitudeInput.
+4. AttitudeEstimator::update():
+   - gyro valid, calibrated, 1 ms old: OK. dt = 7000 - 6990 = 10 ms.
+   - |omega| tiny -> not turning. | |f| - g | = 0.5 m/s^2 <= 1.0 -> the
+     magnitude gate passes (a +1.5 m/s^2 climb would be rejected: the
+     correction is skipped and that step is gyro-only). Angle to predicted
+     up ~0.1 deg -> Accepted. Note: a VERTICAL acceleration does not change
+     the direction of f, so accepting it does not tilt the estimate.
+   - MadgwickFilter::update integrates omega over 10 ms and moves q by
+     at most 2*0.1*0.01 rad towards the measured up.
+   - finalize(): state Tracking6Axis, Euler ~ (0, 0, yaw), flags include
+     MountingUnverified, AccelNotCalibrated, HeadingUnreferenced.
+   - GravityCompensator: R(q) f_body = (0, 0, 10.31); minus g ->
+     vertical linear acceleration ~ +0.50 m/s^2, valid and reliable.
+5. attitudeOut_.publish() copies the 164-byte estimate into the mailbox.
+6. Within 1 s HealthMonitorTask copies it to g_systemHealth:
+   verticalAccel_mmps2 ~ 500, attitudeState 2 (Tracking6Axis).
+7. Next milestone: the UKF will read linearAccel.vertical_mps2 together with
+   the barometric altitude to estimate vertical speed and altitude.
+
+End of document.

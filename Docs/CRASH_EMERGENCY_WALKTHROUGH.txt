@@ -1,0 +1,598 @@
+================================================================================
+ PARAGUARDIAN - CRASH DETECTION, EMERGENCY MANAGER AND ALERTS: WALKTHROUGH
+ Milestone 6. For an engineering student who must understand and defend the code.
+================================================================================
+
+Read with:  Docs/CRASH_EMERGENCY_DESIGN.md (the "what"), Docs/CRASH_EMERGENCY_VALIDATION_REPORT.md
+(the numbers). Everything here is simulation-validated only. Nothing ran on hardware. A "suspected
+crash" is NOT a confirmed crash and says NOTHING about injury.
+
+Contents
+  A. What crash detection means here
+  B. Why accelerometer magnitude is not linear acceleration
+  C. Why impact spikes alone are insufficient
+  D. Multi-sensor evidence
+  E. Temporal windows
+  F. State machines
+  G. Hysteresis and cooldowns
+  H. Crash suspicion versus emergency escalation
+  I. Countdown and cancellation
+  J. Manual SOS
+  K. Incident IDs and idempotency
+  L. BLE versus phone versus contact acknowledgment
+  M. Retry / backoff
+  N. Event queues
+  O. Alert priorities
+  P. Audio / LED scheduling
+  Q. FreeRTOS task design
+  R. Simulation and fault injection
+  S. How to defend the implementation in a capstone review
+  T. File-by-file reference (purpose, parameters, key statements, tests, alternatives, limits)
+  U. Worked scenario 1: crash -> countdown -> SOS -> phone -> delivery outcome
+  V. Worked scenario 2: false alarm cancelled by the pilot
+
+--------------------------------------------------------------------------------
+A. WHAT CRASH DETECTION MEANS HERE
+--------------------------------------------------------------------------------
+The device measures:
+  - forces on a box on a harness;
+  - how that box rotates;
+  - how high it is (barometer, LiDAR);
+  - how fast it moves (GNSS).
+It does NOT measure the pilot's body, consciousness or injuries. So the firmware can only say:
+
+  "possible impact"   (ImpactCandidate)
+       a sudden, corroborated force or rotation peak;
+  "suspected crash"   (CrashSuspected)
+       that peak, plus enough independent context (what happened before, what happened after),
+       satisfying an explicit, documented rule.
+
+A suspicion does not call anyone. It opens an INCIDENT whose first step is a COUNTDOWN that asks the
+pilot "are you OK? cancel me". Only when nobody cancels is an SOS REQUEST created, and even then
+whether help is reached depends on a phone and a network the firmware cannot see.
+
+--------------------------------------------------------------------------------
+B. WHY ACCELEROMETER MAGNITUDE IS NOT LINEAR ACCELERATION
+--------------------------------------------------------------------------------
+An accelerometer measures SPECIFIC FORCE f = a - g: everything except gravity's pull.
+  - At rest, f points up with magnitude 1 g (9.81 m/s^2), even though nothing accelerates.
+  - In free fall, f is about 0, even though the device accelerates at 1 g.
+  - In a 60-degree banked turn, |f| is about 2 g.
+So |f| is NOT "how hard the device is accelerating". The crash detector never subtracts gravity
+from |f|; it uses |f| directly:
+  - Impulse:   |f| peak far above its recent baseline (a sudden rise).
+  - Quiet:     ||f| - g| small and rotation small (lying still). No attitude needed.
+  - Free fall: |f| < 0.35 g for 150 ms (falling freely: a dropped device).
+Gravity-compensated linear acceleration (Madgwick, Milestone 3) is used by the UKF, not here, so
+gravity can never be removed twice.
+
+--------------------------------------------------------------------------------
+C. WHY IMPACT SPIKES ALONE ARE INSUFFICIENT
+--------------------------------------------------------------------------------
+Things that make a large |f| peak without a crash:
+  - a hard but fine landing (3-6 g);
+  - a spiral dive (3-4 g sustained);
+  - a collapse and recovery (2-4 g);
+  - turbulence (1.5-3 g);
+  - dropping the device on a table (10+ g);
+  - shaking it;
+  - one IMU going faulty (any value).
+Things that make a crash with a modest peak:
+  - landing in a tree;
+  - a slow slide down a slope;
+  - an impact shorter than the 10 ms polling interval (missed or under-read).
+A threshold alone would therefore both cry wolf and miss. The test crash_single_accelerometer_
+threshold_never_suspects proves a 12 g spike on the ground never leads to a suspicion.
+
+--------------------------------------------------------------------------------
+D. MULTI-SENSOR EVIDENCE
+--------------------------------------------------------------------------------
+The detector counts NAMED, INDEPENDENT indicators (bits in crashev::*):
+
+  impulse (IMU):  HighSpecificForce, SevereSpecificForce, HighAngularRate, SevereAngularRate,
+                  SuddenForceChange, SuddenRateChange, ImuSaturation
+  before impact:  AirborneAtImpact (flight phase), TakeoffAttempt, FastDescent (UKF sink rate),
+                  GroundClosure (LiDAR close and closing), HighGroundSpeed (GNSS),
+                  FreeFallBeforeImpact
+  after impact:   Inactivity, AbnormalOrientation (attitude tilt), RepeatedImpacts,
+                  PilotActivity (reported only), ResumedFlight (counter-evidence),
+                  PostImpactDataMissing
+
+Independence:
+  - The impulse comes from the IMUs.
+  - Context comes from the barometric UKF, LiDAR and GNSS.
+  - Orientation comes from Madgwick.
+  - Inactivity comes from the IMUs again, but in a different time window.
+Missing sources are FLAGGED (crashflag::NavigationMissing, LidarMissing, GnssMissing,
+AttitudeMissing). They are never assumed "OK" or "bad".
+
+Corroboration across the three IMUs: the detector uses the SECOND-LARGEST per-IMU peak. With three
+IMUs, one faulty IMU (spiking or dead) can neither create nor hide an impulse. With two IMUs it uses
+the smaller. With one IMU the impulse can never be "strong".
+
+--------------------------------------------------------------------------------
+E. TEMPORAL WINDOWS
+--------------------------------------------------------------------------------
+All windows use real timestamps, compared as signed differences: int32(a - b), see
+Processing/TimeBase.hpp. So they work across the uint32 millisecond wrap at 49.7 days. Frame counts
+are never used: frames can be late, missing or repeated.
+
+  baseline     EMA of |f| and |rate| with tau 0.5 s, from NON-impulse frames only
+  candidate    500 ms after the first peak: collect the rest of the same pulse
+  pre-window   3 s before the impact (from the history)
+  recent       30 s: "was airborne recently" (landed then crashed still counts)
+  observation  2 s minimum, 10 s maximum after the impact
+  inactivity   4 s of quiet (short blips <= 200 ms tolerated)
+  orientation  2 s of tilt >= 60 degrees while not rotating fast
+  resumed      3 s of GNSS >= 6 m/s while airborne and clear of the ground
+
+The HISTORY is 32 slots x 250 ms = 8 s. Each slot keeps:
+  - min vz, min clearance, max closure, max GNSS speed;
+  - "airborne" and "takeoff candidate" flags.
+It is fixed memory, and the scan is bounded (32 slots, only when an impulse starts).
+
+--------------------------------------------------------------------------------
+F. STATE MACHINES
+--------------------------------------------------------------------------------
+Crash detector:  Monitoring -> ImpactCandidate -> PostImpactObservation -> CrashSuspected
+                 (or Rejected) -> Cooldown -> Monitoring;  Unavailable when no IMU data.
+Emergency:       Idle -> Countdown -> SosPending <-> AwaitingPhoneAck -> AwaitingDelivery ->
+                 Delivered | DeliveryUnknown | DeliveryFailed;  Cancelled;  Unavailable.
+
+Why state machines? Each state says exactly which inputs matter and which transitions are allowed.
+A test can drive any path, and the state goes into g_systemHealth so a debugger shows it. Every
+transition is time-driven or input-driven, never hidden in a counter.
+
+--------------------------------------------------------------------------------
+G. HYSTERESIS AND COOLDOWNS
+--------------------------------------------------------------------------------
+  - Impulse baseline: a peak must exceed its own recent average by 2 g (force) or 250 dps
+    (rotation). Slow load changes never trigger.
+  - Quiet tolerance: a 200 ms blip does not reset the inactivity timer. A longer movement does.
+  - Rejected is displayed 1 s.
+  - After a suspicion the detector holds CrashSuspected 60 s, then spends 30 s in Cooldown. Further
+    impacts are counted but can't open a second suspicion. Then it re-arms.
+  - The emergency manager re-arms after a cancellation (10 s), or after an explicit
+    ResetIncident once an SOS outcome is known.
+  - Landing warnings keep their own hysteresis and cooldown from Milestone 5.
+
+--------------------------------------------------------------------------------
+H. CRASH SUSPICION VERSUS EMERGENCY ESCALATION
+--------------------------------------------------------------------------------
+Two classes, two tasks, one direction of data:
+  - CrashDetector (SensorProcessingTask) decides SUSPICION. It knows nothing about SOS.
+  - EmergencyManager (EmergencyAlertTask) decides ESCALATION. It latches a suspicion by the
+    detector's suspicionSerial counter (a counter, not a level, so a short-lived state can't be
+    missed), opens an incident and starts the countdown.
+A suspicion during an open incident only increments additionalImpacts, so there is never a second
+incident. If the detector withdraws its suspicion (flight resumed) during an AUTOMATIC countdown,
+the manager cancels it, unless the pilot already confirmed it by pressing SOS.
+
+--------------------------------------------------------------------------------
+I. COUNTDOWN AND CANCELLATION
+--------------------------------------------------------------------------------
+  - The countdown is a DEADLINE (now + 60 s automatic, + 5 s manual; placeholders), checked by
+    tick(now). There is no delay, sleep or loop.
+  - Boundary: a cancel ISSUED at or before the deadline wins. Expiry happens strictly after the
+    deadline (tick: reached(now, deadline + 1)). The task handles commands BEFORE ticking.
+  - Late processing: a cancel issued at 30 s but processed after a 75 s scheduler gap is still
+    honoured, because the command carries its issue time (test em_43_44).
+  - Late expiry: if the task was delayed, the expiry happens at the next tick. The lateness is
+    recorded (countdownOverrunMs, CountdownOverrun flag) and never hidden.
+  - Cancelling needs the incident id: you can't cancel "whatever is running".
+  - After the request has LEFT the device, a cancel cannot recall it. The manager sends a
+    cancellation NOTICE (same incident, next revision, kind Cancel) and reports CancelNotice
+    Pending, then Sent, then Accepted or Failed. "Accepted" means only that the phone accepted the
+    notice. Contacts may already have been alerted.
+
+--------------------------------------------------------------------------------
+J. MANUAL SOS
+--------------------------------------------------------------------------------
+A ManualSos command needs no crash evidence:
+  - in Idle it opens an incident with a 5 s guard countdown (an accidental press can still be
+    cancelled);
+  - during an automatic countdown it confirms immediately;
+  - while sending it has no effect (idempotent);
+  - after a final outcome it re-sends the same incident with a fresh position.
+Commands come from abstract sources (HardwareInput, PhoneApp, Diagnostic, Test) through
+EmergencyAlertTask::submitCommand(). No button is assumed to exist.
+
+--------------------------------------------------------------------------------
+K. INCIDENT IDs AND IDEMPOTENCY
+--------------------------------------------------------------------------------
+"Idempotent" means doing the same thing twice has the same effect as doing it once.
+  - Every incident has an id (1, 2, ...; never 0). Every request revision has a number (1, 2, ...).
+  - The phone deduplicates by (device, incidentId), so re-sending after a disconnect is safe.
+  - Commands carry (source, sequence): the same pair twice is a duplicate.
+  - Reports carry (incidentId, revision):
+      wrong incident       -> ignored;
+      revision never sent  -> ignored;
+      same stage again     -> duplicate, ignored.
+    So a duplicate acknowledgment can never create a new incident.
+  - Without persistence (firmware today) ids restart after a reset. The request says so
+    (IncidentIdVolatile).
+
+--------------------------------------------------------------------------------
+L. BLE VERSUS PHONE VERSUS CONTACT ACKNOWLEDGMENT
+--------------------------------------------------------------------------------
+  Created             the firmware built the request          (nothing left the device)
+  QueuedForTransport  submit() accepted it into a buffer       (not sent)
+  TransferredToPhone  the BLE write completed                  (the radio delivered bytes)
+  AcceptedByPhone     the phone APP said "parsed and accepted" (the app has it)
+  PhoneSendAttempted  the app started an SMS / call / upload   (an attempt)
+  DeliveryConfirmed   the app REPORTED a delivery confirmation (an SMS delivery report is not a
+                      human reading it, and the firmware cannot verify the report)
+Each stage is a different fact from a different party. The manager:
+  - keeps reportedStages (which stages were actually reported);
+  - flags ProvenanceIncomplete when a later stage arrives without an earlier one;
+  - uses DeliveryUnknown when the phone accepted but never reported an outcome.
+None of these is ever turned into success.
+
+--------------------------------------------------------------------------------
+M. RETRY / BACKOFF
+--------------------------------------------------------------------------------
+  - An ATTEMPT is a submit() the transport accepted.
+  - If the phone doesn't accept within 10 s, the attempt failed.
+  - The next attempt waits 2 s, 4 s, 8 s, 16 s, 32 s, then 60 s (exponential backoff), so a
+    struggling link is not flooded.
+  - 8 attempts make one cycle. Then DeliveryFailed (RetriesExhausted), with an alert to the pilot.
+  - A reconnect starts at most 2 more cycles; a manual SOS always re-sends.
+  - Waiting for a link is NOT an attempt: the request stays pending forever, with
+    TransportUnavailable raised. A request is never silently dropped.
+Measured in the host test: 12.0 s and 14.0 s between the first attempts; exhaustion after 262 s.
+
+--------------------------------------------------------------------------------
+N. EVENT QUEUES
+--------------------------------------------------------------------------------
+SafetyEvent (40 B) is a TRANSITION, not a sample: Raised, Escalated, Deescalated, Cleared, Notice.
+The processing task's SafetyEventQueue<16> is bounded and priority-aware. When full, it drops the
+oldest lowest-severity event, and never a critical one for a lower one. Milestone 6 adds:
+  - its first CONSUMER: the dispatcher in EmergencyAlertTask;
+  - crash events in the same queue (same emitter, one id sequence);
+  - the manager's events in a task-local queue (its own emitter, its own id sequence).
+The SOS state is NOT carried by events. The dispatcher reads EmergencyStatus directly, and the
+pending request lives in PendingSosRecord, so a full advisory queue can't lose an SOS.
+
+--------------------------------------------------------------------------------
+O. ALERT PRIORITIES
+--------------------------------------------------------------------------------
+One table, AlertPriorityPolicy.hpp:
+  SOS countdown 100 > crash alarm 95 > communication failure 92 > SOS active 90
+  > landing Critical 80-84 > Warning 60-64 > Caution 40-44 > Advisory 20-24.
+The highest priority drives the audio, and separately the LED; ties go to the most recent alert.
+  - Acknowledgment silences the AUDIO of an acknowledgeable alert episode. The LED keeps showing
+    it, and escalation sounds again.
+  - The SOS countdown and the crash alarm cannot be silenced: you cancel them instead.
+
+--------------------------------------------------------------------------------
+P. AUDIO / LED SCHEDULING
+--------------------------------------------------------------------------------
+AudioAlertScheduler turns "play pattern X" into IAudioAlert::request() calls, one per beep, each
+with its own duration, at the right times. update(now) runs every 20 ms and never waits.
+  - Preemption cancels the current tone and starts the new pattern from its first beep.
+  - A late update plays the next due beep: no burst of missed beeps.
+  - A backend that refuses means state Unavailable, retried once per second.
+LedPatternScheduler forwards only pattern CHANGES and computes the reference on/off level
+levelAt(pattern, phaseMs). That function is the timing spec for a future GPIO driver.
+The firmware backends are Unconfigured (no pins known): they report Unavailable honestly.
+
+--------------------------------------------------------------------------------
+Q. FREERTOS TASK DESIGN
+--------------------------------------------------------------------------------
+  SensorAcq      40  10 ms   reads sensors (unchanged)
+  EmergencyAlert 36  20 ms or on notification   NEW
+  SensorProc     32  per frame   + CrashDetector after SafetyMonitor
+  Health         16  1 s     + 45 new health fields
+
+Why 36? Above processing, so if processing overruns, the countdown, a cancel or a retry still
+runs on time. Below acquisition, so sampling is never delayed. Its work is tiny and bounded
+(estimated < 0.1 ms per wake). The static_asserts in TaskConfig.hpp lock this ordering in.
+
+Why not inside SensorProc? A countdown inside processing stops when frames stop, and a crash may
+break a sensor or stall processing.
+
+Synchronisation, everything non-blocking:
+  - latest-value mailboxes for every struct crossing tasks;
+  - one producer and one consumer per queue;
+  - locked bounded inboxes for commands and reports;
+  - critical sections only around copies of <= 188 bytes.
+ulTaskNotifyTake() with a 20 ms timeout is the only blocking call, and it is the task's idle wait
+(no busy loop).
+
+--------------------------------------------------------------------------------
+R. SIMULATION AND FAULT INJECTION
+--------------------------------------------------------------------------------
+Tests/sim/CrashSimulator.hpp layers on the Milestone 5 simulator (true kinematics, terrain, LiDAR
+ray-tracing, the REAL SafetyMonitor). Ground contact is DETECTED from the truth, and impacts are
+attached to it. Each IMU is sampled at its own instant within the 10 ms cycle (short pulses can be
+missed). Values clip at 16 g with a saturation flag.
+
+Faults injected:
+  - GNSS, LiDAR or barometer loss;
+  - one IMU absent, offset or spiking;
+  - total IMU dropout;
+  - processing silence;
+  - clock wrap;
+  - 75 s scheduler gaps;
+  - queue overflow;
+  - transport down, phone disconnect, ack loss, wrong incident, delivery failure;
+  - resets with mock persistence;
+  - audio or LED absent.
+Parameters were swept on a TUNING set, then FROZEN, then run on a separate HELD-OUT set. Two
+honest ambiguity tests show cases the algorithm can't separate (hard landing vs crash).
+
+--------------------------------------------------------------------------------
+S. HOW TO DEFEND THE IMPLEMENTATION IN A CAPSTONE REVIEW
+--------------------------------------------------------------------------------
+Likely questions and short answers:
+
+Q: "Why not just a 4 g threshold?"
+A: Section C. The test crash_single_accelerometer_threshold_never_suspects, and the spiral, drop,
+   shake and hard-landing scenarios.
+
+Q: "Why not run it on the UKF output?"
+A: The UKF smooths and gates; it would remove the impulse. We use per-IMU peaks before smoothing.
+   The test real_pipeline_carries_impact_peaks_and_saturation_before_any_smoothing shows a batch
+   with the impact in the middle sample is kept, and a saturated sample is flagged even though the
+   voter drops it.
+
+Q: "What if an IMU fails during the crash?"
+A: Second-largest corroboration. Scenarios 20, 21 and 21b.
+
+Q: "What if all sensors die after impact?"
+A: Explicit policy: StrongImpactDataLoss (scenario 22). If the processing task itself dies, the
+   manager's DetectorSilence rule applies.
+
+Q: "Is a suspicion a crash?"
+A: No. It is a reason to ask the pilot (countdown). Section 4.3 of the validation report shows two
+   cases we deliberately cannot separate.
+
+Q: "How do you know the SOS was delivered?"
+A: We don't. We know what the phone app REPORTED, stage by stage, with provenance. DeliveryUnknown
+   exists for exactly this.
+
+Q: "What if the queue overflows?"
+A: Critical events are kept, losses are counted as id gaps, and the SOS state never travels
+   through the queue.
+
+Q: "Does it work on the board?"
+A: Builds: yes, 0 errors and 0 warnings. Hardware: not tested. Transport, audio, LED and
+   persistence are unconfigured on purpose, until the schematic and protocols are verified.
+
+Q: "Where do the numbers come from?"
+A: Physically motivated placeholders (design section 5), swept in simulation (report 4.1). Real
+   recordings are the next step (HARDWARE_INTEGRATION_TODO.md section 16).
+
+Weak points to admit up front:
+  - synthetic data only;
+  - 100 Hz polling;
+  - 16 g saturation;
+  - hard landing vs crash ambiguity;
+  - dragging could look like resumed flight;
+  - no persistence on target;
+  - countdown durations not human-factors validated.
+
+--------------------------------------------------------------------------------
+T. FILE-BY-FILE REFERENCE
+--------------------------------------------------------------------------------
+
+T1. Components/Processing/ProcessedSensorFrame.hpp, PreprocessingPipeline.hpp/.cpp (modified)
+  Purpose:   carry per-IMU impact evidence since the previous frame.
+  Fields:    peakAccelNorm_mps2, peakGyroNorm_radps, peakTimestampMs, samplesSinceFrame,
+             accelSaturatedSinceFrame, gyroSaturatedSinceFrame.
+  Key code:  handleImu(): an = |accelSensor|, gn = |gyroSensor| (norms are rotation-invariant, so
+             sensor axes are fine); keep the max since the frame; set the saturation flags from the
+             validator's AccelSaturated / AccelOutOfRange bits. fillImu() copies them. buildFrame()
+             resets them.
+  Why here:  only the pipeline sees every accepted sample. A frame alone shows just the newest.
+  Tests:     real_pipeline_carries_impact_peaks_and_saturation_before_any_smoothing; all 393 old
+             tests unchanged.
+  Rejected:  a separate high-rate queue to a crash task (more RAM and copies, same information).
+  Limits:    only samples the acquisition actually read (100 Hz polling).
+
+T2. Algorithms/Crash/CrashConfig.hpp
+  Purpose:   every threshold, with its reason. isValid() rejects inconsistent sets: severe > impact,
+             candidate < minObservation < observation, a history long enough for the pre-window.
+  Tests:     crash_config_defaults_valid_and_invalid_rejected; the sweep test changes them.
+
+T3. Algorithms/Crash/CrashTypes.hpp
+  Purpose:   CrashState, ImpactClass, CrashDecision, crashev / crashflag bits, CrashImuChannel,
+             CrashInput, ImpactSummary, CrashStatus, IncidentContext, CrashReport. All trivially
+             copyable (static_asserts) for mailbox copies.
+
+T4. Algorithms/Crash/CrashDetector.hpp/.cpp
+  readImpulse()       per IMU: skip if no samples, if not newer than its last peak (replay), or if
+                      non-finite; sort; second-largest = corroborated; saturation needs 2 IMUs;
+                      count uncorroborated peaks.
+  isImpulse()         force: >= impactAccel AND >= baseline + impulseMin;
+                      rate:  >= impactRate AND >= rate baseline + rateImpulseMin;
+                      or corroborated saturation.
+  classify()          Strong if severe force, severe rate impulse, force + rate impulse, or
+                      saturation, AND >= 2 IMUs. Otherwise Moderate.
+  recordHistory()     250 ms slots; clears the history after a gap longer than 8 s.
+  evaluatePreContext  scans slots overlapping [t0 - 3 s, t0]; sets the pre bits and the missing-
+                      source flags; records vz / clearance / speed before the impact.
+  trackPostImpact()   quiet, tilt, activity, repeated pulses, resumed flight, data-missing
+                      fraction. Missing data is neither quiet nor active.
+  decide()            the rule table (design 6.4). ResumedFlight always rejects.
+  update()            order: reject older frames; dt (capped at one window); airborne bookkeeping;
+                      history; impulse; per-frame f / w; jumps; free fall; state switch; baselines
+                      (non-impulse frames only); counts.
+  Events:             ImpactCandidate Raised / Cleared, CrashSuspected Raised / Cleared. The
+                      episodeId ties them together.
+  Tests:              test_crash_detector.cpp (19 tests, scenarios 1-25).
+  Rejected:           a probability score (unvalidated weights look more certain than they are);
+                      max-of-IMUs (one fault creates impacts).
+  Limits:             synthetic tuning; the hard-landing ambiguity; Madgwick tilt after violent
+                      impacts.
+
+T5. Algorithms/Crash/CrashInputAdapter.hpp
+  crashInputFrom(frame, attitude, snapshot, navigation): copies the per-IMU peaks, voted |f| and
+    |w|, tilt (quat::rotate of body z), phase, LiDAR, UKF vz and GNSS speed.
+  updateIncidentContext(): keeps the LAST VALID fix (2D / 3D / GNSS+DR only) with its time, and
+    the latest valid barometric altitude / vz with time. It never overwrites with invalid data.
+  CrashReportMailbox: latest-value hand-over (status + context + publish time = heartbeat).
+  Tests: incident_context_keeps_last_valid_fix_with_its_time; real_pipeline test.
+
+T6. Algorithms/Emergency/EmergencyTypes.hpp, EmergencyConfig.hpp
+  States, triggers, DeliveryStage (ordered success path), stagebit (provenance), FailureReason,
+  CancelNotice, emflag, EmergencyStatus (all counters). The config holds the placeholder durations
+  and the retry policy; isValid() bounds them (e.g. the countdown must be < 2^31 ms for wrap-safe
+  comparison).
+
+T7. Algorithms/Emergency/EmergencyCommand.hpp
+  EmergencyCommand + makeEmergencyCommand() (integrity word = magic XOR fields) + isWellFormed().
+  Cancel and Reset require an incident id. TransportReport kinds. BoundedInbox<T, N>: locked FIFO;
+  when full, the NEW item is dropped and counted (a command is never silently replaced).
+  Tests: em_32, emergency_command_inbox_is_bounded.
+
+T8. Algorithms/Emergency/SosRequest.hpp/.cpp, SosRequestMailbox.hpp
+  The v1 request and the 64-byte frame (layout in design 10.1); crc32Ieee (bitwise, no table:
+  small flash); encode / decode with version + CRC checks; toLegacySosPayload() for the old
+  unversioned format; PendingSosRecord (the reliable latest-value record).
+  Tests: sos_request_encoding_roundtrip_and_integrity (all 512 single-bit errors detected),
+         sos_request_without_gnss_states_no_position.
+
+T9. Algorithms/Emergency/ISosTransport.hpp, IEmergencyStore.hpp
+  Interfaces. UnconfiguredSosTransport (link down, submit Unavailable) and NullEmergencyStore
+  (unavailable) are the firmware defaults. Persistence record: 32 bytes with CRC and range checks.
+
+T10. Algorithms/Emergency/EmergencyManager.hpp/.cpp
+  restore()         load + validate the record; continue the incident (Countdown -> full restart;
+                    in flight -> resend with the Restored bit; terminal -> keep).
+  observeCrash()    copy the context; strong-pending supervision; latch suspicionSerial (a counter
+                    going backwards = detector restarted -> re-synchronise, don't act);
+                    auto-cancel on a cleared suspicion.
+  handleCommand()   integrity, dedupe, then the per-state rules (design section 9).
+  handleReport()    LinkUp / LinkDown; otherwise incident + revision checks; stage bits;
+                    duplicate protection; outcomes.
+  tick()            detector-silence rule; countdown expiry (strictly after the deadline); delivery
+                    timeout -> Unknown; cancel re-arm; serviceTransport(); remaining-time fields.
+  serviceTransport  waiting for an ack -> timeout = attemptFailed; else, when due: no link ->
+                    TransportUnavailable (not an attempt); submit -> Accepted / Busy / LinkDown /
+                    Invalid.
+  attemptFailed     count; exhausted -> DeliveryFailed (or the cancel notice Failed); else backoff.
+  buildRequest      fills the request from the context; validity bits; navigation only if
+                    <= 5 s old.
+  persist           on transitions only.
+  Tests: test_emergency_manager.cpp (25 tests, scenarios 26-46 + extras).
+  Rejected: giving up when no link; treating BLE write completion as delivery; persisting every tick.
+
+T11. Algorithms/Safety/AlertTypes.hpp, AlertPriorityPolicy.hpp, ValueMailbox.hpp
+  AlertKind, AudioPatternId, AlertStyle, OutputState, DispatchStatus; the single priority table;
+  the generic latest-value mailbox.
+
+T12. Algorithms/Safety/SafetyEventDispatcher.hpp/.cpp
+  consume()    duplicate / older id -> ignore; gap counting per emitter; latency; landing Raised /
+               Escalated -> restart the sound, clear the ack, transient hold 2 s; emergency notices
+               -> edge serials.
+  update()     landing alerts from a FRESH snapshot (stale -> hold 3 s -> SystemDegraded);
+               emergency alerts from EmergencyStatus; crash alarm only while no incident handles
+               it; choose audio and LED separately; key = kind / severity / episode / edge so a
+               change restarts the pattern.
+  acknowledge  silences an acknowledgeable alert episode.
+  Tests: test_alert_dispatch.cpp (13 tests, scenarios 47-58) and the e2e tests.
+
+T13. Output/Audio/AudioAlertScheduler.hpp/.cpp
+  Pattern table (tone, on, gap, beeps, repeat, volume). update(): restart on a new key (cancel the
+  old tone); request one beep at a time; refused -> Unavailable + 1 s retry; groups repeat from the
+  group start, never overlapping, never bursting after a gap. UnconfiguredAudioAlert refuses
+  everything (NotInitialized).
+  Tests: alert_58 (timing across the wrap and after a 5 s gap), alert_55.
+
+T14. Output/LED/LedPatternScheduler.hpp/.cpp
+  levelAt() reference timing; setPattern only on change; tick each update; Unavailable when the
+  backend says available() == false. IStatusLed gained available() with a default.
+
+T15. Tasks/EmergencyAlertTask.hpp/.cpp, TaskConfig.hpp, RunInterface.cpp
+  Construction wires manager -> local queue. Run() order (commands, reports, crash report, tick,
+  publish, events, dispatcher, publish, timing). submitCommand / submitTransportReport push + notify.
+  RunInterface creates the task after SensorProc and registers it with Health.
+
+T16. Tasks/SensorProcessingTask.*, SystemHealth.hpp, HealthMonitorTask.*
+  Processing: updateIncidentContext + crash_.update(crashInputFrom(...), safety_.eventEmitter())
+  + publish the CrashReport (built in a member, not on the stack).
+  Health: 45 new fields; copies into members (the health stack is only 2 KiB).
+
+--------------------------------------------------------------------------------
+U. WORKED SCENARIO 1: normal flight -> impact -> suspicion -> countdown -> SOS -> phone -> outcome
+--------------------------------------------------------------------------------
+(Numbers from test e2e_64_suspected_crash_countdown_sos_phone_ack_delivery; times in simulation
+seconds.)
+
+ 0.0 s   On launch, still. Phase Unknown -> Ground. CrashDetector Monitoring. Manager Idle. LED slow
+         green (normal).
+10-13 s  Take-off run; the climb starts. The phase becomes TakeoffCandidate, then Flying (Milestone 5).
+         The history slots start recording "airborne", vz, clearance and GNSS speed.
+33-40 s  Glide at -1.2 m/s, 10 m/s. No impulse: the IMU peaks stay near 1 g, and the EMA baseline
+         follows them.
+40.0 s   Collapse: the sink becomes -9 m/s. The UKF vz drops; the LiDAR clearance falls and the
+         closure rate rises; Approach is entered below 30 m.
+44.63 s  GROUND CONTACT (detected by the simulator from the truth). A 10 g / 600 dps half-sine
+         pulse of 40 ms. Frame 1 sees ~6.3 g (the IMUs read at 3/2/1 ms before the frame), frame 2
+         ~9.9 g.
+           readImpulse: three peaks, second-largest ~6.3 g >= 4 g, and 6.3 - 1.0 >= 2 g -> impulse;
+           rate 600 dps >= 400 and >= baseline + 250 -> strong (force + rate).
+           startCandidate: new episode; evidence = HighSpecificForce | HighAngularRate | ...;
+           evaluatePreContext over 41.6-44.6 s: AirborneAtImpact, RecentlyAirborne, FastDescent
+           (min vz ~ -9), GroundClosure (clearance < 10 m, closure ~9 m/s). pre = 3.
+           Event ImpactCandidate / Raised (Advisory).
+45.13 s  The candidate window (500 ms) ends: eligible (airborne) -> PostImpactObservation. The peak
+         is now ~9.9 g (Severe).
+46.64 s  2.0 s after the impact: strong AND pre >= 2 -> CrashSuspected (StrongImpactWithContext).
+         Events: CrashSuspected / Raised (Critical), ImpactCandidate / Cleared. suspicionSerial = 1.
+46.64 s  EmergencyAlertTask (next 20 ms wake): observeCrash sees serial 1 -> openIncident(Automatic):
+         incident 1, deadline = now + 60 s. Event EmergencyCountdown / Raised.
+         The dispatcher: SosCountdown (priority 100) beats everything; the audio plays CountdownTick
+         1/s and the LED shows SOS red. The pilot is lying still at 80 degrees and doesn't cancel.
+ ~96.6 s Last 10 s: CountdownFinal (2 beeps/s).
+106.66 s Deadline passed (strictly): expireCountdown -> createRequest. Request revision 1, with:
+           - Position + fix age;
+           - GNSS MSL height;
+           - relative baro altitude;
+           - vz;
+           - impact 9.9 g / ~600 dps, evidence bits;
+           - battery unknown;
+           - validity bits.
+         Stage Created. Event EmergencyRequest (Notice, Critical). The SAME tick: the link is up ->
+         submit() Accepted -> attempt 1, stage QueuedForTransport, AwaitingPhoneAck,
+         ack deadline +10 s. Dispatcher: SosActive (SOS amber, long tone every 10 s).
+106.71 s Mock phone: WriteCompleted -> TransferredToPhone (BLE level only).
+107.46 s Mock phone: PhoneAccepted (rev 1, incident 1) -> AwaitingDelivery. Event SosPhoneAccepted.
+108.16 s Mock phone: PhoneSendAttempted -> stage PhoneSendAttempted (still NOT delivered).
+114.66 s Mock phone: DeliveryConfirmed -> Delivered (as REPORTED by the app). Event
+         SosDeliveryConfirmed. Dispatcher: SosAccepted (blue slow blink + an info chime) for 30 s.
+         reportedStages = all six bits; no ProvenanceIncomplete.
+ later   The incident stays Delivered until ResetIncident(1) (operator / phone), then Idle. The
+         crash detector itself went to Cooldown after its 60 s hold and re-armed 30 s later.
+
+What can go differently: the phone never accepts (retries 12 s, 14 s, ... -> DeliveryFailed after
+~262 s, a CommFailure alert to the pilot), it accepts but never reports (DeliveryUnknown after
+120 s), or the link is down (pending forever, TransportUnavailable, no attempts consumed).
+
+--------------------------------------------------------------------------------
+V. WORKED SCENARIO 2: false alarm cancelled by the pilot
+--------------------------------------------------------------------------------
+(Test e2e_63_suspected_crash_cancelled_by_the_pilot; the same flight and impact as U.)
+
+44.63 s  The same impact; suspicion at 46.64 s; incident 1 opens; the countdown sounds.
+66.66 s  The pilot (conscious, perhaps winded) presses CANCEL. The hardware command source builds
+         makeEmergencyCommand(CancelSos, HardwareInput, seq, incidentId = 1, now) and calls
+         EmergencyAlertTask::submitCommand(). The notification wakes the task at once.
+         handleCommand:
+           - well-formed? yes;
+           - duplicate? no;
+           - incident 1 = the open incident? yes;
+           - Countdown, issued before the deadline -> cancel(Command).
+         Nothing left the device -> CancelNotice None (fully withdrawn).
+         Events: EmergencyCountdown / Cleared, EmergencyCancelled / Notice.
+         Dispatcher: the countdown alert disappears; nothing else is active -> silent, LED normal.
+76.66 s  10 s later: Cancelled -> Idle (re-armed). sosRequestsCreated = 0, transport.sent is empty.
+         The crash detector is in its suspected-hold / cooldown: a second bump in the next ~90 s
+         is counted but opens no new suspicion. After that a new incident gets id 2.
+
+If the pilot had pressed cancel 1 ms AFTER the deadline: the request would already exist, but if
+the transport had not taken it yet it would still be withdrawn locally (test em_29 c). If it had
+already been sent, a cancellation notice would follow, and the status would say the alert may
+already be out (test em_cancel_after_send_sends_a_cancellation_notice).
+================================================================================

@@ -1,0 +1,564 @@
+PARAGUARDIAN - FLIGHT STATE, LIDAR GROUND CLEARANCE AND LANDING SAFETY WALKTHROUGH (Milestone 5)
+=================================================================================================
+
+Date: 2026-11-18
+Audience: an engineering student learning embedded systems and safety
+algorithms. You know vectors, basic trigonometry and C++, and you have read
+(or can look up) the attitude and UKF walkthroughs.
+
+What this document is: a tour of the ACTUAL code in
+Components/Algorithms/Flight/, Landing/ and Safety/, how it is wired into
+SensorProcessingTask, and how it was tested. All the numbers in section Q
+were produced by running the real classes.
+
+What this document is NOT: evidence that ParaGuardian detects flight phases
+or hazards correctly on a real paraglider. Everything was tested in
+simulation on a laptop. Nothing ran on the STM32 or flew. Every threshold is
+a provisional development value. The algorithms do not replace pilot
+judgement, approved equipment or flying procedures.
+
+AI-use disclosure: this code and this document were produced with AI
+assistance (Claude Code), under the student's direction, for the student's
+review. Attribute it accordingly under your university's policy.
+
+Companion documents:
+  Docs/FLIGHT_LANDING_DESIGN.md             decisions, rules, parameters
+  Docs/FLIGHT_LANDING_VALIDATION_REPORT.md  every measured number
+  Docs/VERTICAL_UKF_WALKTHROUGH.txt         where altitude / vertical speed come from
+  Docs/MADGWICK_ATTITUDE_WALKTHROUGH.txt    where the attitude quaternion comes from
+
+Contents
+  A. What a flight-state machine is
+  B. Why one threshold is insufficient
+  C. Hysteresis
+  D. Dwell timers
+  E. Evidence-based transitions
+  F. Altitude is not clearance
+  G. LiDAR geometry
+  H. Slant range and tilted sensors
+  I. Terrain effects
+  J. Descent-rate detection
+  K. Time to contact
+  L. Warning severity
+  M. Warning priorities and events
+  N. Fault handling
+  O. FreeRTOS integration
+  P. Simulation and validation
+  Q. Worked example: one LiDAR sample to one SafetyEvent
+  R. Class-by-class reference
+  S. How crash detection and SOS will use this
+  T. Questions a reviewer may ask
+
+
+A. WHAT A FLIGHT-STATE MACHINE IS
+----------------------------------
+A state machine is a variable that can take a few named values (states),
+plus rules saying when it may move from one to another (transitions).
+Ours is pg::FlightPhase (Flight/FlightStateTypes.hpp):
+
+  Unknown, Ground, TakeoffCandidate, Flying, Approach, LandingCandidate, Landed
+
+Why bother? Later code asks "is the pilot flying?" constantly:
+  - a descent warning makes no sense while the device sits in a car;
+  - a crash detector must know whether a big jolt happened in flight or
+    on a table.
+The state machine answers once, carefully, so that every consumer does not
+invent its own answer.
+
+The two "Candidate" states are deliberate. They mean "something suggests a
+change, I am checking". A phase only becomes Flying or Landed after the
+evidence has held for a while.
+
+
+B. WHY ONE THRESHOLD IS INSUFFICIENT
+--------------------------------------
+Tempting: "if vertical speed < -0.5 m/s, we are flying". Every simple rule
+fails on a normal day:
+  - a paraglider in lift flies LEVEL or climbs (vertical speed 0 or positive);
+  - in a strong headwind it can fly at almost 0 km/h ground speed;
+  - a pilot walking up a launch hill gains 100 m of altitude;
+  - a car ride is fast;
+  - a device dropped on the floor falls at 4 m/s for a moment.
+Each sensor is fooled by something. So the detector collects several
+independent pieces of EVIDENCE (section E) and needs more than one, or one
+strong one, held for long enough.
+
+
+C. HYSTERESIS
+--------------
+Hysteresis means different thresholds for switching ON and switching OFF.
+Example from FlightStateConfig:
+
+  approachClearance_m     = 30   Flying   -> Approach when clearance < 30 m
+  approachExitClearance_m = 45   Approach -> Flying   when clearance > 45 m
+
+Without the 15 m gap, a pilot soaring at 30 m would flip between Flying and
+Approach every time the LiDAR noise (about 30 cm at that range) crosses 30 m.
+The warnings use the same idea. ExcessiveDescent enters Caution at 3.5 m/s
+of sink and stays until the sink is below 3.0 m/s (descentHysteresis_mps =
+0.5). The helper is graded() in LandingSafetyAnalyzer.cpp:
+
+    const float t = (current >= levels[i]) ? thresholds[i] - hyst : thresholds[i];
+    if (x > t) out = levels[i];
+
+"If I am already at this level, the bar to stay is lower."
+
+
+D. DWELL TIMERS
+----------------
+A dwell (or persistence) timer requires a condition to be true
+CONTINUOUSLY for some time before acting. The detector uses a tiny helper:
+
+    static uint32_t persist(bool cond, bool& active, uint32_t& since, uint32_t nowMs)
+    // returns how long `cond` has been continuously true (0 = false now)
+
+Examples:
+  - takeoffConfirmMs  = 3000: two airborne sources for 3 s -> Flying;
+  - landingConfirmMs  = 5000: LandingCandidate held for 5 s -> Landed;
+  - descentPolicy.raiseMs = 1000: sink above the threshold for 1 s before
+    a warning is raised.
+
+Dwell timers trade SPEED for ROBUSTNESS. The sweep (validation report
+section 9) shows it directly: takeoffConfirmMs of 1 / 3 / 6 s gives takeoff
+detection 2.3 / 4.3 / 7.3 s after lift-off.
+
+A lesson from testing: a dwell timer is only as good as its input. The first
+"altitude steady" test used ONE noisy vertical-speed sample per frame. With
+0.12 m/s noise it failed about 1 % of the time, and each failure RESTARTED the
+2 s landing timer. Landing detection took 31 s. Judging steadiness over the
+whole 8 s window fixed it (15 s).
+
+
+E. EVIDENCE-BASED TRANSITIONS
+------------------------------
+Evidence is a set of bits computed every update (namespace flightev).
+
+  AIRBORNE                                 GROUND
+  LidarHigh        clearance > 2.5 m       LidarNearGround  clearance <= 2.5 m
+                   (the strong one)
+  GnssFast         ground speed > 6 m/s    GnssSlow         ground speed < 1 m/s
+  VerticalMotion   |vz| > 0.8 m/s for 3 s  AltitudeSteady   8 s window: spread <= 2 m,
+                                                            net rate < 0.3 m/s
+  AltitudeDeparture |h - h_ground| > 15 m  Still            IMU quiet (RMS accel < 0.4,
+                                                            rate < 0.05 rad/s)
+
+Key rules (FlightStateDetector::update):
+  - Ground -> TakeoffCandidate: any airborne evidence.
+  - TakeoffCandidate -> Flying:
+      * 2 sources or LidarHigh for 3 s, OR
+      * 1 source for 15 s, but never AltitudeDeparture alone (walking
+        uphill).
+  - A valid LiDAR that sees the ground (LidarNearGround) VETOES takeoff
+    confirmation: running fast with the wing up is not flying.
+  - No airborne evidence for 2 s -> back to Ground ("aborted takeoff").
+  - Flying -> LandingCandidate: 2 ground sources and NO airborne evidence for
+    2 s; then 5 s more -> Landed.
+  - Nothing usable at all -> the phase is HELD and the timers are frozen.
+
+The "support" field (None / Weak / Moderate / Strong) counts the agreeing
+sources. It is NOT a probability: nobody has measured how often each
+combination is right on real flights. Calling it "87 % sure" would invent
+evidence that does not exist.
+
+
+F. ALTITUDE IS NOT CLEARANCE
+-----------------------------
+Three different "heights" exist on the device:
+  UKF altitude_m   relative to where the barometers were calibrated (the launch)
+  GNSS height      relative to sea level
+  LiDAR clearance  distance down to the terrain under the beam
+
+After launching from a 1 000 m mountain and gliding over a valley, the UKF
+can say "-300 m" while the valley floor is 700 m below. The code never uses
+altitude as clearance. Altitude only feeds the evidence "the altitude moved
+a lot since takeoff" (AltitudeDeparture) and "the altitude stays put"
+(AltitudeSteady).
+
+
+G. LIDAR GEOMETRY
+------------------
+The TF02-Pro shoots one beam and reports the distance r to whatever it hits,
+measured ALONG THE BEAM. To know how far below we are, we need the beam's
+direction in the world:
+
+  1. The beam direction in body axes is configuration:
+       GroundClearanceConfig::beamBody = (0, 0, 1)   // body FRD z = down when level
+     This is a PLACEHOLDER (no hardware). mountingVerified = false, and every
+     output is flagged MountingUnverified.
+  2. The attitude quaternion q = q_ENU_from_body rotates it into the world:
+       d_ENU = q (x) b (x) q*        (quat::rotate in GroundClearanceEstimator::beamEnu)
+  3. ENU z points UP. A downward beam has d_ENU.z < 0. The "projection
+     factor" is
+       p = -d_ENU.z = cos(angle between the beam and straight down)
+  4. The vertical distance to the point the beam hit is
+       clearance = r * p
+
+Why the minus sign: ENU's z is up, the beam goes down, so d_ENU.z is
+negative, and the clearance must be positive.
+
+
+H. SLANT RANGE AND TILTED SENSORS
+----------------------------------
+In a 30-degree bank over flat ground at 10 m, the beam is tilted 30 degrees
+from vertical. It hits the ground at slant range r = 10 / cos 30 = 11.55 m.
+Reporting 11.55 m as "clearance" would be 15 % wrong. The projection gives
+11.55 * 0.866 = 10.00 m (test gc_17_18_19: exactly 10.000).
+
+Limits:
+  - Tilt > 40 degrees (maxBeamTiltDeg): REFUSED (status BeamGeometry). The
+    point hit is then more than 0.84 r away sideways, and small attitude
+    errors dominate.
+  - Beam horizontal or pointing up: refused. A clearance is never invented.
+  - Tilt > 20 degrees: still valid but flagged HighTilt.
+
+Uncertainty (clearanceSigma_m) adds three effects:
+  range noise times p, (r sin(tilt) times the attitude error), and a
+  second-order term:
+      sigma_c^2 = (sigma_r p)^2 + (r sin(theta) sigma_theta)^2 + (0.5 r p sigma_theta^2)^2
+  With the mounting unverified, 5 degrees of mounting uncertainty is added to
+  sigma_theta. That is why the worked example in Q reports 0.54 m: mostly
+  "we don't know exactly where the LiDAR points".
+
+
+I. TERRAIN EFFECTS
+-------------------
+r * p is the height above the ILLUMINATED POINT. It equals the height above
+the ground directly beneath you only if the ground is flat. On a slope the
+beam lands uphill or downhill of you.
+
+From the test, 15 m above the slope, 20-degree bank:
+    slope 10 deg: +1.03 m or -0.90 m;  20 deg: +2.29 / -1.75 m;  30 deg: +3.99 / -2.60 m
+The estimate equals the illuminated-point truth to < 1 mm. The error is the
+ASSUMPTION, not the arithmetic, so it is flagged (FlatTerrainAssumed) rather
+than "corrected" with a slope a single beam cannot see.
+
+Sudden changes (cliffs, bushes, buildings, water) are REAL more often than
+not. The estimator therefore does NOT smooth the clearance. A 12 m cliff
+drop shows up in the next sample (32.2 m vs 32 m truth). A jump larger than
+max(1.5 m, 10 %) only:
+  - sets StepChange;
+  - restarts the closure-rate history, so a slope fitted across the step
+    cannot invent a fake closure rate.
+
+
+J. DESCENT-RATE DETECTION
+--------------------------
+Two different "rates" exist:
+  - UKF vertical speed vz: movement relative to the AIR / barometric
+    reference, positive up.
+  - LiDAR closure rate: how fast the distance to the TERRAIN shrinks,
+    positive = approaching.
+Flying level (vz = 0) towards a hill gives closure > 0. Descending over a
+valley that falls away faster gives closure < 0. Test gc_23: level flight at
+9 m/s over terrain rising 1:5 -> UKF vz 0, LiDAR closure 1.99 m/s (truth 1.8).
+
+The closure rate is the least-squares SLOPE of the clearance over the last
+400 ms (GroundClearanceEstimator::fitRate):
+  - at least 6 samples spanning 200 ms, timestamps used (variable dt);
+  - a residual RMS > 0.5 m (spiky data) -> no rate;
+  - latency ~ half the window (200 ms);
+  - noise: at 30 m the range noise is ~0.3 m, so the rate noise is ~0.3-0.4
+    m/s. The reported sigma (0.33 m/s mean) says so.
+Why not differentiate two samples? (30.3 - 30.0) / 0.01 s = 30 m/s of pure
+noise. One sample cannot give a rate at all.
+
+ExcessiveDescent (navigation) warns at 3.5 / 6 / 10 m/s of sink (Caution /
+Warning / Critical). Only if the UKF velocity is fresh and its sigma <= 1 m/s.
+If it is not, NavigationDegraded says why (test C41).
+
+
+K. TIME TO CONTACT
+-------------------
+  TTC = clearance / closure_rate        (seconds; constant closure assumed)
+
+Computed only when:
+  - clearance and rate are valid;
+  - closure > 0.3 m/s;
+  - closure - 2 sigma > 0 (really approaching, not noise);
+  - TTC <= 60 s.
+Otherwise ttcValid = false and timeToContact_s = NaN: "no contact predicted".
+It is never 0 (that would mean "impact now") and never infinity.
+
+It is an APPROXIMATION. A flare or a turn changes the closure, and so does
+terrain shape. Adding the UKF vertical acceleration was considered and
+rejected: it is acceleration relative to the air, not to uneven terrain.
+
+
+L. WARNING SEVERITY
+--------------------
+  Info < Advisory < Caution < Warning < Critical   (SafetyEvent.hpp)
+
+  Advisory  awareness only: LowGroundClearance on every final approach;
+            TerrainClearanceUnavailable; NavigationDegraded
+  Caution   something is unusual: sink > 3.5 m/s; closure > 4 m/s;
+            fast descent with no LiDAR
+  Warning   act: sink > 6 m/s; TTC < 4 s; low and descending fast
+  Critical  urgent: sink > 10 m/s; TTC < 2 s; < 6 m and > 3.5 m/s down
+
+These numbers are PROVISIONAL. There is no universally safe descent rate.
+A big-ears descent is ~3-4 m/s on purpose; a spiral dive can exceed 15 m/s.
+
+
+M. WARNING PRIORITIES AND EVENTS
+---------------------------------
+Each warning has a tracker (LandingSafetyAnalyzer::step). The desired level
+is computed every frame, but EVENTS are published only on changes:
+
+  Raised -> (Escalated / Deescalated)* -> Cleared     one episodeId throughout
+
+  - raise needs persistence (e.g. 1 s), escalation less (0.5 s), Critical
+    least (half / none);
+  - relaxing (de-escalate or clear) needs persistence too (2 s), so warnings
+    do not flicker;
+  - cooldown (e.g. 20 s): if the same warning comes back at the same or a
+    lower severity soon after clearing, it is tracked (visible in the
+    snapshot) but NOT announced again. Higher severity or Critical is always
+    announced (test C46).
+
+A held warning produces ONE event, not one every 10 ms (test
+ls_events_only_on_transitions). Consumers that need "still active" read the
+SafetySnapshot.
+
+Queue priority (SafetyEventQueue): when full, the oldest LOWEST-severity
+event is dropped to make room for a more severe one. A Critical is never
+lost to lower-priority traffic (2 000 events, 10x slow consumer: 0 critical
+dropped).
+
+
+N. FAULT HANDLING
+------------------
+Principles:
+  1. Missing is never zero. Invalid numbers are NaN with a status
+     (ClearanceStatus, *Valid flags).
+  2. Missing is never "safe". A warning whose input disappears is HELD for
+     3 s (evidenceHoldMs), flagged degraded, then released.
+  3. A missing sensor is reported once (TerrainClearanceUnavailable,
+     NavigationDegraded), not repeated.
+  4. Outages never cause Landed: with no input at all the phase is held.
+  5. Contradictions are resolved by the sensor that measures the right thing.
+     Terrain hazards use the LiDAR closure rate; only when it is missing is
+     navigation -vz used, flagged DegradedEvidence. A navigation-only descent
+     of -6 m/s with a steady LiDAR raises ExcessiveDescent but no terrain
+     hazard.
+  6. Unverified hardware is visible everywhere: LidarMountingUnverified,
+     ImuMountingUnverified, ModelPlaceholder (from the UKF), Unvalidated (all
+     thresholds).
+
+Tested faults:
+  - all IMUs (attitude invalid);
+  - both barometers (UKF unavailable);
+  - UKF degraded;
+  - GNSS lost;
+  - LiDAR lost;
+  - +30 m altitude jump;
+  - stale timestamps;
+  - wrong mounting;
+  - queue overflow.
+In every case: no false landing and no Warning-or-higher.
+
+
+O. FREERTOS INTEGRATION
+------------------------
+SensorProcessingTask::Run() gained one line after the navigation update:
+
+    safetyOut_.publish(safety_.update(pg::safetyInputFrom(work_, attitude_.latest(), navigation_.latest())));
+
+  - No new task. The safety update costs ~126 ns on a laptop, estimated
+    40-130 us on the STM32. A separate task would cost a stack (>= 1 KB), a
+    queue and copies, and would see data later.
+  - Order inside SafetyMonitor::update(): clearance -> flight phase ->
+    phase notice -> warnings. Each uses THIS frame's attitude and navigation,
+    so nothing is stale or circular.
+  - Outputs:
+      * safety()       SafetySnapshotMailbox (copy under a critical section);
+      * safetyEvents() SafetyEventQueue<16> (one consumer task pops).
+  - Health: g_systemHealth gained 24 fields (phase, clearance, warnings,
+    counters, queue statistics). Watch them in STM32CubeIDE Live
+    Expressions.
+  - Memory: +3 088 B static RAM, +11 584 B flash (Release), no heap. The
+    deepest stack chain (navigation) is ~0.97 KB of the 4 KiB processing
+    stack.
+
+
+P. SIMULATION AND VALIDATION
+-----------------------------
+Testing safety logic with its own assumptions proves nothing, so the
+simulator (Tests/sim/FlightSafetySimulator.hpp) is independent:
+  - LiDAR truth: the beam is rotated by the simulator's OWN Euler matrices
+    and marched through the terrain in 2 cm steps with bisection. The
+    geometry tests also use the closed-form ray-plane intersection. The
+    firmware uses a quaternion and a projection: two different methods
+    agreeing to 2e-5 m.
+  - Expected results come from TRUTH: the true lift-off time, the true
+    touchdown, the true time to contact, not the thresholds.
+  - Tuning used seeds 1-3. Defaults were then frozen, and the scenario tests
+    use held-out seeds 101-110.
+  - D55 runs the REAL preprocessing, Madgwick and UKF before the safety layer.
+Honest limits: synthetic motion is not real flight, and the "IMU stillness"
+of real pilots is unknown.
+
+
+Q. WORKED EXAMPLE: ONE LIDAR SAMPLE TO ONE SAFETYEVENT
+-------------------------------------------------------
+Scenario: started at 30 m over flat ground, 20-degree bank, 5-degree pitch,
+heading 30 degrees, sinking 1 m/s then 3.2 m/s from t = 6 s. Real classes,
+seed 7.
+
+Step 1 - the sample (t = 9.00 s)
+  truth height above ground 14.400 m (sensor)   true slant range 15.383 m
+  measured range (noise) r = 15.500 m
+  attitude q = (w, x, y, z) = (-0.17172, 0.84827, 0.49849, -0.04954)
+
+Step 2 - beam into ENU (beamEnu)
+  d_ENU = q (x) (0,0,1) (x) q* = (-0.2552, 0.2419, -0.9361)
+  matches the simulator's independent truth beam to 4 decimals
+  projection p = -d_ENU.z = 0.9361  -> tilt = acos(0.9361) = 20.59 deg
+  (for a body-down beam cos(tilt) = cos(roll) * cos(pitch) = 0.9397 * 0.9962 = 0.9361:
+   the 20-degree bank and 5-degree pitch give 20.59 degrees, not 25)
+
+Step 3 - clearance
+  clearance = r * p = 15.500 * 0.9361 = 14.510 m   (truth 14.40)
+  sigma = 0.536 m: mostly the 5-degree unverified mounting,
+          r sin(theta) sigma = 15.5 * 0.352 * 0.0942 = 0.51 m
+
+Step 4 - closure rate (41 samples over the last 400 ms)
+  closure = +2.866 m/s (approaching), sigma 0.708 m/s, latency 200 ms
+  (true closure 3.2 m/s: inside 1 sigma)
+  UKF vz at that moment: -3.316 m/s (same story from a different sensor)
+
+Step 5 - time to contact
+  closure - 2 sigma = 2.866 - 1.416 > 0  -> valid
+  TTC = 14.510 / 2.866 = 5.06 s
+
+Step 6 - descent assessment (t = 9.00 s)
+  phase Approach (clearance < 30 m since t = 6 s)
+  ExcessiveDescent: sink 3.3 < 3.5 m/s caution         -> level 0
+  RapidGroundClosure: closure 2.9 < 4 m/s caution      -> level 0
+  HazardousApproach: clearance 14.5 < 15 m AND closure 2.9 > 2.5 m/s
+                                                       -> desired level Warning
+  LowGroundClearance: 14.5 m > 10 m                    -> level 0
+
+Step 7 - warning decision
+  The HazardousApproach tracker starts its 500 ms raise persistence at ~8.8 s.
+
+Step 8 - SafetyEvent publication (t = 9.33 s)
+  EVENT id 3, episode 1, type HazardousApproach, transition Raised,
+        severity Warning, phase Approach,
+        vz -3.03 m/s, clearance 13.51 m, closure 3.23 m/s, TTC 4.18 s,
+        qualityFlags 0xc68 = ModelPlaceholder | LidarMountingUnverified |
+                             FlatTerrainAssumed | ImuMountingUnverified | Unvalidated
+  Then at 11.43 s: LowGroundClearance Advisory raised (clearance < 10 m for 1 s).
+  No more events while the conditions persist. The snapshot shows them active.
+
+Step 9 - who receives it
+  SafetyEventEmitter::emit -> SafetyEventQueue<16> (firmware) -> the future
+  audio task pops it and plays a Warning tone once, then repeats from the
+  snapshot while active.
+
+
+R. CLASS-BY-CLASS REFERENCE
+----------------------------
+R.1 Safety/SafetyInput.hpp - SafetyInput, safetyInputFrom()
+  Responsibility: copy the ~140 bytes the safety layer needs, keeping every
+    source's own time and validity.
+  Inputs: ProcessedSensorFrame, AttitudeEstimate, NavigationEstimate (real
+    field names).
+  Output: SafetyInput.
+  Key statements: groundSpeed = sqrt(vN^2 + vE^2); |linear accel| from
+    linearAccel.enu_mps2; LiDAR reject reasons passed through.
+  Why not pass the whole structs? ~1.4 KB per frame, and coupling to every
+    field.
+  Tests: all simulator tests use the same layout; D55 uses the adapter on
+    real data.
+
+R.2 Landing/GroundClearanceEstimator.cpp - update()
+  Responsibility: section G-K.
+  Inputs: SafetyInput.lidar / .attitude.
+  Output: GroundClearance (status, flags, slant, beam, projection, clearance,
+    sigma, lower bound, rate, TTC, counters).
+  Key statements:
+      const bool newSample = L.valid && (!haveSample_ || L.timestampMs != lastSampleTs_);
+      const float proj = -d.z;  if (!(proj >= cosMaxTilt_)) -> BeamGeometry
+      out_.clearance_m = r * proj;
+      ... StepChange -> resetRate(); addRateSample(); fitRate(); TTC rules
+  Alternatives rejected: smoothing the clearance (hides cliffs); per-sample
+    differentiation (noise); correcting for slope (unobservable).
+  Tests: test_ground_clearance.cpp (13).
+  Limitations: flat-terrain assumption; mounting placeholder; ~0.35 m/s rate
+    noise at 30 m.
+
+R.3 Flight/FlightStateDetector.cpp - update()
+  Responsibility: sections A-E.
+  Inputs: SafetyInput, GroundClearance.
+  Output: FlightStateStatus (phase, previous, since, support, evidence bits,
+    flags, ground reference, motion RMS, counters).
+  Key statements: evidence bits; persist(); takeoffMulti / takeoffSingle /
+    groundLike; hold when !anyInput.
+  Alternatives rejected: single thresholds; probability scores (uncalibrated);
+    using altitude as clearance.
+  Tests: test_flight_state.cpp (14), D47, D55.
+  Limitations: heuristic; slower without LiDAR / GNSS; car rides with the
+    LiDAR not seeing the ground.
+
+R.4 Landing/LandingSafetyAnalyzer.cpp - update(), step(), held()
+  Responsibility: sections J-N.
+  Inputs: SafetyInput, FlightStateStatus, GroundClearance.
+  Output: SafetySnapshot warning fields + events via SafetyEventEmitter.
+  Key statements: graded() hysteresis; the evidence requirements per warning;
+    step() = raise / escalate / relax / cooldown; held() = evidence hold.
+  Tests: test_landing_safety.cpp (16), D49-D54, fault tests.
+  Limitations: provisional thresholds; flare not addressed.
+
+R.5 Safety/SafetyEvent.hpp, SafetyEventEmitter.hpp, SafetyEventQueue.hpp,
+    SafetySnapshotMailbox.hpp
+  Responsibility: section M.
+  Key statements: emit() numbers events; queue publish() overflow policy;
+    pop() FIFO.
+  Tests: ls_54_* (2), D54, D55.
+
+R.6 Safety/SafetyMonitor.cpp - update()
+  Responsibility: order of the three algorithms, phase notices, snapshot,
+    quality flags.
+  Tests: every simulator test.
+
+
+S. HOW CRASH DETECTION AND SOS WILL USE THIS
+---------------------------------------------
+  - The crash detector reads the snapshot and the IMU for impact patterns
+    (e.g. a large acceleration spike, then stillness). It publishes
+    SafetyEvent{type = CrashSuspected (reserved), source = CrashDetector}
+    through the same emitter, so event ids stay one sequence.
+  - The emergency manager pops the queue. It decides on SOS using
+    CrashSuspected + phase (was Flying, now Landed / Unknown) + time without
+    motion + pilot cancel. Severity and episode identity are already there.
+  - Audio / LED play Raised / Escalated once and repeat from the snapshot
+    while active.
+  - Logging registers its own queue with SafetyMonitor::addSink(). Gaps in
+    eventId reveal lost events.
+Nothing in the producers needs to change for these consumers.
+
+
+T. QUESTIONS A REVIEWER MAY ASK
+--------------------------------
+Q: Why not just use altitude to detect landing?
+A: Altitude is relative to the launch. You may land 800 m lower. Only its
+   CHANGE and STEADINESS are evidence.
+
+Q: What if the LiDAR is mounted crooked?
+A: A 10-degree error gives up to 0.85 m error at 10 m (tested). Every output
+   says MountingUnverified until it is checked on the real harness.
+
+Q: Could the device think it landed during a long glide in calm air?
+A: It needs two ground sources AND no airborne source. With a working LiDAR
+   or GNSS, a flying pilot always has one (LidarHigh / out of range,
+   GnssFast). With both missing, very calm level flight could look
+   "steady + still". This is documented as a limitation.
+
+Q: Why no flare warning?
+A: Flare timing depends on the wing, wind, airspeed and technique. One beam
+   and a vertical speed cannot determine it safely, so no command is given.
+
+Q: How do you avoid alarm fatigue?
+A: Persistence, hysteresis, cooldowns, transition-only events, and
+   advisories that never escalate on their own. 20 normal simulated flights
+   gave 0 Caution-or-higher.

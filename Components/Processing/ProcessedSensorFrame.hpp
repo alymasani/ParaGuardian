@@ -10,8 +10,8 @@
  *
  * WHAT IT IS (and is not):
  *   specificForce_mps2  body FRD, accelerometer specific force (gravity NOT
- *                       removed - that needs attitude, i.e. the future
- *                       Madgwick filter). At rest, level: (0, 0, -9.81).
+ *                       removed - that needs attitude: see
+ *                       AttitudeEstimate::linearAccel). At rest, level: (0, 0, -9.81).
  *   angularRate_radps   body FRD, gyro bias removed.
  *   baroAltitude_m      height relative to where the barometer reference was
  *                       taken, positive UP, ISA approximation; drifts with weather.
@@ -20,9 +20,12 @@
  *                       + receiver time-of-week, never mixed).
  *   lidar               pass-through of the latest valid range.
  *
- * Future consumers:
+ * Consumers:
  *   Madgwick: angularRate (+ gyroDtMs), specificForce, optional mag.
- *   UKF:      baroAltitude, (Madgwick-derived vertical acceleration), gnss, lidar.
+ *   UKF (VerticalNavigationEstimator, via navigationInputFrom()): baroAltitude
+ *             (+ per-barometer timestamps / references), gnss vertical
+ *             velocity + speedAccuracy; vertical acceleration comes from
+ *             the AttitudeEstimate. lidar: future landing package.
  *
  * Plain data: trivially copyable, fixed size, safe to copy into a mailbox/queue.
  ******************************************************************************
@@ -105,6 +108,16 @@ struct ImuChannelInfo {
     bool fresh;                  ///< age <= maxAge
     bool accelUsable;
     bool gyroUsable;
+    // ---- impact evidence since the PREVIOUS frame (crash detection, before any smoothing) ----
+    // A frame normally carries one sample per IMU, but if processing was delayed several
+    // samples may have been ingested; these keep the largest of them instead of only the
+    // newest. Saturated / out-of-range samples ARE included (their value is a lower bound).
+    float peakAccelNorm_mps2;    ///< largest |specific force| (sensor-calibrated, gravity NOT removed)
+    float peakGyroNorm_radps;    ///< largest |angular rate| (bias-corrected if calibrated)
+    uint32_t peakTimestampMs;    ///< timestamp of the sample with the largest |specific force|
+    uint16_t samplesSinceFrame;  ///< accepted samples since the previous frame (0 = peaks not meaningful)
+    bool accelSaturatedSinceFrame;  ///< a sample hit the accel full scale (value clipped)
+    bool gyroSaturatedSinceFrame;   ///< a sample hit the gyro full scale (value clipped)
 };
 
 struct BaroChannelInfo {
@@ -140,6 +153,7 @@ struct GnssInfo {
     float verticalVelocity_mps;  ///< positive up
     float horizontalAccuracy_m;
     float verticalAccuracy_m;
+    float speedAccuracy_mps;     ///< NAV-PVT sAcc (receiver's speed accuracy estimate)
     uint8_t numSatellites;
     GnssFixType fixType;
     bool valid;
@@ -151,6 +165,12 @@ struct LidarInfo {
     uint32_t timestampMs;
     uint32_t ageMs;
     bool valid;
+    /// reject::* bits of the newest REJECTED sample (0 = none yet), e.g.
+    /// LidarOutOfRange (no return within the driver's max range) or
+    /// LidarWeakSignal (strength < 60 or saturated). Lets consumers tell
+    /// "beyond range" from "sensor silent". Pass-through only.
+    uint32_t lastRejectReasons;
+    uint32_t lastRejectTimestampMs;
 };
 
 struct ProcessedSensorFrame {

@@ -25,6 +25,12 @@ enum class AlertTone : uint8_t {
     LowBattery,
     Warning,     ///< e.g. future obstacle / terrain proximity warning
     Emergency,   ///< SOS in progress
+    // Milestone 6 (AudioAlertScheduler): appended, existing values unchanged
+    Advisory,    ///< single soft chime
+    Caution,
+    Critical,    ///< terrain / descent critical
+    Countdown,   ///< SOS countdown tick
+    CommFailure, ///< SOS could not be handed to / accepted by the phone
 };
 
 enum class AlertPriority : uint8_t { Low = 0, Normal, High, Critical };

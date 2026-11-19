@@ -95,6 +95,12 @@ ValidationResult PreprocessingPipeline::ingest(const SensorMessage& msg, uint32_
     if (knownId && v.reasons != 0u) {
         if (isImu(h->id)) imu_[imuIndex(h->id)].lastRejectReasons = v.reasons;
         if (isBaro(h->id)) baro_[baroIndex(h->id)].lastRejectReasons = v.reasons;
+        if (h->id == SensorId::Lidar0 && !v.accepted) {
+            // Kept so consumers can tell "no return beyond max range / weak signal"
+            // from "LiDAR silent" (the accepted-sample slot below is not touched).
+            lidar_.lastRejectReasons = v.reasons;
+            lidar_.lastRejectTimestampMs = h->timestampMs;
+        }
     }
 
     if (!v.accepted) {
@@ -159,6 +165,22 @@ void PreprocessingPipeline::handleImu(const ImuSample& s, const ValidationResult
     st.accelBody = alignment_.toBody(id, accelSensor);
     st.gyroBody = alignment_.toBody(id, gyroSensor);
     newImu_ = true;
+
+    // Impact evidence for crash detection: the largest magnitudes since the last
+    // frame, INCLUDING saturated / out-of-range channels (a clipped value is a lower
+    // bound, flagged). Norms are rotation-invariant, so sensor axes are fine.
+    const float an = std::sqrt(accelSensor.x * accelSensor.x + accelSensor.y * accelSensor.y +
+                               accelSensor.z * accelSensor.z);
+    const float gn = std::sqrt(gyroSensor.x * gyroSensor.x + gyroSensor.y * gyroSensor.y +
+                               gyroSensor.z * gyroSensor.z);
+    if (st.samplesSinceFrame == 0u || an > st.peakAccelNorm) {
+        st.peakAccelNorm = an;
+        st.peakTimestampMs = s.header.timestampMs;
+    }
+    if (st.samplesSinceFrame == 0u || gn > st.peakGyroNorm) st.peakGyroNorm = gn;
+    if (st.samplesSinceFrame != UINT16_MAX) ++st.samplesSinceFrame;
+    if ((v.reasons & (reject::AccelSaturated | reject::AccelOutOfRange)) != 0u) st.accelSaturatedSinceFrame = true;
+    if ((v.reasons & (reject::GyroSaturated | reject::GyroOutOfRange)) != 0u) st.gyroSaturatedSinceFrame = true;
 }
 
 void PreprocessingPipeline::handleBaro(const BaroSample& s)
@@ -207,6 +229,14 @@ void PreprocessingPipeline::fillImu(uint32_t nowMs, ProcessedSensorFrame& f)
         info.gyroUsable = st.gyroUsable;
         info.accelBody_mps2 = st.accelBody;
         info.gyroBody_radps = st.gyroBody;
+        info.samplesSinceFrame = st.samplesSinceFrame;
+        if (st.samplesSinceFrame != 0u) {
+            info.peakAccelNorm_mps2 = st.peakAccelNorm;
+            info.peakGyroNorm_radps = st.peakGyroNorm;
+            info.peakTimestampMs = st.peakTimestampMs;
+            info.accelSaturatedSinceFrame = st.accelSaturatedSinceFrame;
+            info.gyroSaturatedSinceFrame = st.gyroSaturatedSinceFrame;
+        }
 
         acc[i] = VoteInput{info.fresh && st.accelUsable, st.accelBody, st.timestampMs};
         const bool gyroCalOk = st.gyroCalibrated || !cfg_.requireGyroCalibration;
@@ -353,6 +383,7 @@ void PreprocessingPipeline::fillOthers(uint32_t nowMs, ProcessedSensorFrame& f)
         g.verticalVelocity_mps = s.verticalVelocity_mps;
         g.horizontalAccuracy_m = s.horizontalAccuracy_m;
         g.verticalAccuracy_m = s.verticalAccuracy_m;
+        g.speedAccuracy_mps = s.speedAccuracy_mps;
         g.numSatellites = s.numSatellites;
         g.fixType = s.fixType;
     }
@@ -366,6 +397,8 @@ void PreprocessingPipeline::fillOthers(uint32_t nowMs, ProcessedSensorFrame& f)
         f.lidar.ageMs = timebase::ageMs(s.header.timestampMs, nowMs);
         f.lidar.valid = fresh(SensorId::Lidar0, s.header.timestampMs, nowMs);
     }
+    f.lidar.lastRejectReasons = lidar_.lastRejectReasons;
+    f.lidar.lastRejectTimestampMs = lidar_.lastRejectTimestampMs;
     if (!f.lidar.valid) f.qualityFlags |= quality::LidarUnavailable;
 }
 
@@ -398,6 +431,11 @@ void PreprocessingPipeline::buildFrame(uint32_t nowMs, ProcessedSensorFrame& f)
     f.samplesRejectedSinceLastFrame = rejectedSinceFrame_;
 
     newImu_ = newBaro_ = newOther_ = false;
+    for (size_t i = 0; i < kImuCount; ++i) {   // impact peaks are "since the previous frame"
+        imu_[i].samplesSinceFrame = 0u;
+        imu_[i].accelSaturatedSinceFrame = false;
+        imu_[i].gyroSaturatedSinceFrame = false;
+    }
     lostSinceFrame_ = 0u;
     rejectedSinceFrame_ = 0u;
     inc(stats_.framesBuilt);

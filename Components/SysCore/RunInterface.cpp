@@ -19,6 +19,7 @@
 #include "SystemDefines.hpp"
 #include "BSP/BoardConfig.hpp"
 #include "SysCore/FaultHooks.h"
+#include "Tasks/EmergencyAlertTask.hpp"
 #include "Tasks/HealthMonitorTask.hpp"
 #include "Tasks/SensorAcquisitionTask.hpp"
 #include "Tasks/SensorProcessingTask.hpp"
@@ -55,10 +56,17 @@ extern "C" void paraguardian_create_tasks(void)
     SensorProcessingTask& processing = SensorProcessingTask::Inst();
     processing.InitTask(acquisition.hub());
 
-    // 3. Health monitor (also watches its own stack).
+    // 3. Emergency / alert task: crash -> emergency manager -> alert dispatcher.
+    //    Consumes the processing task's safety events; runs on its own period so
+    //    countdowns and retries continue even if sensor frames stop.
+    EmergencyAlertTask& emergency = EmergencyAlertTask::Inst();
+    emergency.InitTask();
+
+    // 4. Health monitor (also watches its own stack).
     HealthMonitorTask& health = HealthMonitorTask::Inst();
     health.watchTask(acquisition.handle(), "SensorAcq");
     health.watchTask(processing.handle(), "SensorProc");
+    health.watchTask(emergency.handle(), "EmergencyAlert");
     health.InitTask();
 }
 

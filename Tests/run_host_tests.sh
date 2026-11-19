@@ -41,6 +41,8 @@ SOURCES="
   $ROOT/Components/Sensors/NEOM9N/NeoM9n.cpp
   $ROOT/Components/Sensors/TF02Pro/Tf02Pro.cpp
   $ROOT/Components/Storage/W25Q128/W25q128.cpp
+  $ROOT/Components/Communications/Bluetooth/BleProtocol.cpp
+  $ROOT/Components/Communications/Bluetooth/BleEmergencyBridge.cpp
   $ROOT/Components/Communications/Bluetooth/EzSerialLink.cpp
   $ROOT/Components/Communications/Bluetooth/SosMessage.cpp
   $ROOT/Components/Acquisition/SensorDataHub.cpp
@@ -53,6 +55,22 @@ SOURCES="
   $ROOT/Components/Processing/AxisAlignment.cpp
   $ROOT/Components/Processing/RedundancyVoter.cpp
   $ROOT/Components/Processing/PreprocessingPipeline.cpp
+  $ROOT/Components/Algorithms/Attitude/MadgwickFilter.cpp
+  $ROOT/Components/Algorithms/Attitude/GravityCompensator.cpp
+  $ROOT/Components/Algorithms/Attitude/AttitudeEstimator.cpp
+  $ROOT/Components/Algorithms/Navigation/ConstantAccelerationModel.cpp
+  $ROOT/Components/Algorithms/Navigation/VerticalNavigationEstimator.cpp
+  $ROOT/Components/Algorithms/Navigation/BaroAlphaBetaEstimator.cpp
+  $ROOT/Components/Algorithms/Landing/GroundClearanceEstimator.cpp
+  $ROOT/Components/Algorithms/Landing/LandingSafetyAnalyzer.cpp
+  $ROOT/Components/Algorithms/Flight/FlightStateDetector.cpp
+  $ROOT/Components/Algorithms/Safety/SafetyMonitor.cpp
+  $ROOT/Components/Algorithms/Crash/CrashDetector.cpp
+  $ROOT/Components/Algorithms/Emergency/EmergencyManager.cpp
+  $ROOT/Components/Algorithms/Emergency/SosRequest.cpp
+  $ROOT/Components/Algorithms/Safety/SafetyEventDispatcher.cpp
+  $ROOT/Components/Output/Audio/AudioAlertScheduler.cpp
+  $ROOT/Components/Output/LED/LedPatternScheduler.cpp
 "
 TESTS="$(ls "$ROOT"/Tests/unit/*.cpp)"
 
@@ -60,4 +78,4 @@ echo "Compiler: $($CXX --version | head -n 1)"
 echo "Flags:    $FLAGS"
 # shellcheck disable=SC2086
 $CXX $FLAGS -I"$ROOT/Components" -I"$ROOT/Tests" $SOURCES $TESTS -o "$OUT_DIR/paraguardian_tests"
-"$OUT_DIR/paraguardian_tests"
+(cd "$ROOT/Tests" && "$OUT_DIR/paraguardian_tests")

@@ -142,3 +142,87 @@ Details: `Docs/SENSOR_PREPROCESSING_DESIGN.md`. None of these can be settled wit
 | Magnetometer calibration | Hard/soft-iron calibration with the module in its enclosure | future module; frames carry `MagNotIronCalibrated` |
 | Barometric altitude model | Decide `StandardSeaLevelScale` (specified) vs `IsaAtReference` after comparing with GNSS altitude at a high site | `BaroCalibrationConfig::altitudeModel` |
 | GNSS time | Route the NEO-M9N TIMEPULSE to a timer input-capture pin if MCU↔GPS time alignment is needed | new `IMeasurementTimeModel` implementation |
+
+## 13. Attitude estimation: decisions that need the hardware (Milestone 3)
+
+Details: `Docs/MADGWICK_ATTITUDE_DESIGN.md`, `Docs/MADGWICK_VALIDATION_REPORT.md`. The attitude
+output is **simulation-validated only**.
+
+| Item | What to do | Where it goes |
+|---|---|---|
+| Verified mountings (prerequisite) | Section 12 first: every attitude output carries `attitude::MountingUnverified` until all mountings are verified | `AxisAlignment::setMounting(..., true)` |
+| Sign/convention check | Board level, nose (body +x) north: `rollCentiDeg ≈ pitchCentiDeg ≈ 0`, `verticalAccel_mmps2 ≈ 0`. Raise the nose: pitch positive. Right side down: roll positive. Lift the board quickly: vertical acceleration positive | `g_systemHealth` in Live Expressions |
+| Gain `beta_radps` | Record IMU data in calm and turbulent flight; replay through the host estimator; choose beta from tilt error vs a reference (e.g. GNSS-derived or camera) | `AttitudeConfig::beta_radps` |
+| Turn gate | Measure typical thermalling turn rates and bank angles; the gate (0.10 rad/s) must sit below the slowest turn that matters | `AttitudeConfig::accelRejectionRate_radps` |
+| Gyro bias stability | Measure bias drift over temperature: in long turns/turbulence the attitude is gyro-only for long periods | possibly periodic re-calibration, temperature model |
+| In-flight restart | A reset in flight cannot run the 5 s still gyro calibration: attitude stays `Uninitialized`. Decide whether to persist the last gyro biases in flash (W25Q128) and accept them with a "stale calibration" flag | new feature |
+| Magnetometer | Hard/soft-iron calibration in the enclosure, check field strength/dip at the flying site, magnetic interference from harness metal, speaker magnet (MAX98357A), battery currents | `MagPolicy::CalibratedOnly` stays the default until then |
+| Magnetic declination | Heading is MAGNETIC; add declination (e.g. from GNSS position) if true north is needed | future |
+| Centripetal compensation | With GNSS velocity, the turn-induced specific force (w x v) can be removed so the accelerometer correction works during turns instead of being gated | future milestone |
+| Timing | Toggle a GPIO around `attitude_.update()`; confirm the 25–80 µs estimate | MADGWICK_VALIDATION_REPORT.md §10 |
+
+
+## 14. Vertical navigation (UKF): decisions that need the hardware (Milestone 4)
+
+Details: `Docs/VERTICAL_UKF_DESIGN.md`, `Docs/VERTICAL_UKF_VALIDATION_REPORT.md`. The navigation
+output is **simulation-validated only**, and the process model is a placeholder.
+
+| Item | What to do | Where it goes |
+|---|---|---|
+| Sign check | Device still: `navVerticalVelocity_mmps ≈ 0`, `navAltitude_cm ≈ 0` after calibration. Lift it ~1 m quickly: altitude rises, velocity positive during the lift, then ≈ 0 | `g_systemHealth` in Live Expressions |
+| Execution time | Toggle a GPIO or read DWT `CYCCNT` around `navigation_.update()` and `navigationOut_.publish()`; confirm the 50–150 µs estimate and the mailbox critical section (a few µs) | VERTICAL_UKF_VALIDATION_REPORT.md §12 |
+| Stack | Check the SensorProc high-water mark (`tasks[]` in `g_systemHealth`); 928 B is the static estimate of the deepest navigation chain | `TaskConfig::PROCESSING_STACK_WORDS` |
+| Barometer noise on a worn device | Record both BMP585s at rest, walking, and in flight; measure white and **correlated** error (airflow, body); set `baroSigma_m`; decide whether a barometer-error state (N = 4) or an output σ floor is needed (altitude σ is over-confident under correlated error in simulation) | `NavigationConfig::baroSigma_m` |
+| Accelerometer bias | Measure the LSM6DSRX zero-g offset per IMU (and over temperature). A 0.2 m/s² bias biases vz by ≈ 0.27 m/s with the current 3-state filter. Calibrate in preprocessing (removes `AccelNotCalibrated`), or add a bias state | preprocessing calibration / future model |
+| Process noise | Tune `jerkPsd_m2ps5`, `accelErrorPsd_m2ps3`, the gates and the attitude-quality factors on recorded flights (replay through the host estimator); check NEES/NIS on real data | `NavigationConfig` |
+| Measurement latency | BMP585 conversion time and NEO-M9N navigation latency (time pulse needs a verified pin): apply them as measurement times instead of read-completion times | `IMeasurementTimeModel` (preprocessing) |
+| GNSS vertical velocity | Compare NAV-PVT `velD` / `sAcc` with the barometer in flight; set `gnssSpeedAccuracyScale`, `gnssMinSigma_mps`; confirm the minus sign (velD positive down → vz positive up) on real data | `NavigationConfig` GNSS fields |
+| GNSS altitude | Not used (MSL vs barometric reference). Fusing it needs a datum/offset state | future |
+| Process model | Replace `ConstantAccelerationModel` with a paraglider model (polar, bank angle) once one exists and is validated: implement `IVerticalProcessModel`, change `navModel_` | `SensorProcessingTask.hpp` |
+| Fallback policy | Decide when the safety layer should use `BaroAlphaBetaEstimator` instead (e.g. UKF `NumericalFault` / `Unavailable`); the estimate already carries `estimator` | future safety package |
+
+## 15. Flight state, LiDAR clearance and landing warnings: decisions that need the hardware (Milestone 5)
+
+Details: `Docs/FLIGHT_LANDING_DESIGN.md`, `Docs/FLIGHT_LANDING_VALIDATION_REPORT.md`. Everything is
+**simulation-validated only**; every threshold is a provisional development value; nothing is
+safety-qualified.
+
+| Item | What to do | Where it goes |
+|---|---|---|
+| LiDAR mounting (prerequisite) | Measure the TF02-Pro boresight in BODY axes on the real harness/enclosure (e.g. hang the device level over a floor, compare range with a tape measure at several tilts); then set `GroundClearanceConfig::beamBody` and `mountingVerified = true`. A 10-degree error gives up to 0.85 m error at 10 m | `SafetyConfig.clearance` |
+| LiDAR on the ground | Measure the standing / sitting clearance (harness height) and its spread; check `groundMaxClearance_m` (2.5 m) and `unknownPhaseMinClearance_m` | `FlightStateConfig`, `LandingSafetyConfig` |
+| LiDAR surfaces | Record signal strength and dropouts over grass, crops, water, snow, rock, in direct sun; confirm the driver's 0.1-40 m range and the out-of-range / weak-signal behaviour on the real module | driver + `GroundClearanceConfig` |
+| Beam tilt limit | Check usable tilt (40 degrees) against real thermalling bank angles; availability in steep turns | `maxBeamTiltDeg` |
+| Phase thresholds | Record launches (incl. aborted), walking with the wing, car rides, landings, packing up: tune stillness, GNSS speeds, dwell times; count false / missed transitions | `FlightStateConfig` |
+| Warning thresholds | Review descent / closure / TTC / clearance thresholds with experienced pilots and instructors for the target wings; record approaches | `LandingSafetyConfig` |
+| Timing | Toggle a GPIO or read DWT `CYCCNT` around `safety_.update()`; confirm the 40-130 us estimate and the stack high-water mark | RTOS_TIMING_ANALYSIS.md 4c |
+| Event consumer | Implement the audio / logging task that pops `safetyEvents()`; size the queue for its latency; add a second queue for logging (`SafetyMonitor::addSink`) | future milestone |
+| Flare indication | Not implemented; would need wing/airspeed/wind knowledge and validation | future, optional, disabled by default |
+
+## 16. Crash detection, emergency / SOS and alert outputs: decisions that need the hardware (Milestone 6)
+
+Details: `Docs/CRASH_EMERGENCY_DESIGN.md`, `Docs/CRASH_EMERGENCY_VALIDATION_REPORT.md`. Everything is
+**simulation-validated only**. The transport, audio, LED and persistence backends in firmware are
+explicitly UNCONFIGURED (`UnconfiguredSosTransport`, `UnconfiguredAudioAlert`, `UnconfiguredStatusLed`,
+`NullEmergencyStore`); nothing claims a speaker, LED, BLE link, phone or emergency contact works.
+
+| Item | What to do | Where it goes |
+|---|---|---|
+| Impact data (prerequisite) | Record real drops, hard landings, bumps, harness handling and (ethically sourced / dummy) impacts with the final enclosure and mounting; replace synthetic pulse shapes; re-run the sweeps and freeze new held-out sets | `CrashConfig`, Tests/sim/CrashSimulator.hpp |
+| IMU sampling for impacts | The IMUs run at 416 Hz but are polled at 100 Hz: pulses shorter than ~10 ms can be missed or under-read. Options: read the LSM6DSRX FIFO (all samples), use its wake-up / free-fall interrupt engine, or poll faster; anti-alias filter (LPF1/LPF2 bandwidth) must be chosen on purpose | driver config + `ImuChannelInfo` peaks |
+| IMU full scale | 16 g full scale saturates in hard impacts (detected and flagged, value = lower bound). Decide whether one IMU should run at a different range | `Lsm6dsrxConfig`, `ProcessingConfig::accelLimit_mps2` |
+| Mounting | Body-axis mounting of the IMUs (still placeholders) affects the tilt evidence (`abnormalTilt_rad`) | `AxisAlignment` |
+| Countdown durations | 60 s (automatic) / 5 s (manual) are placeholders: decide with pilots, instructors and the rescue organisation; check audibility of the countdown in wind | `EmergencyConfig` |
+| Pilot input | Decide the physical cancel / manual-SOS control (button, long press, phone only?); implement a debounced command source calling `EmergencyAlertTask::submitCommand()` | new driver + `CommandSource::HardwareInput` |
+| BLE transport | Verify the CYW20822 EZ-Serial command set (HARDWARE_INTEGRATION_TODO.md section 9); implement `ISosTransport` on `EzSerialLink` (non-blocking submit, write-complete events -> `TransportReport`), GATT service for `SosRequest` frames (64 B, CRC-32) | Components/Communications/Bluetooth |
+| Phone app protocol | Implement the app side: decode `SosRequest` v1, deduplicate by (device, incidentId), report PhoneAccepted / PhoneSendAttempted / DeliveryConfirmed / DeliveryFailed / CancelAccepted with the request revision; never report "confirmed" for an API success alone | next milestone |
+| Persistence | Implement `IEmergencyStore` on the W25Q128 (two alternating records, asynchronous write from a low-priority task, never from SensorProc); verify power-loss behaviour; until then SOS continuation across a reset is NOT possible | Components/Storage |
+| Audio | Configure SAI/I2S + DMA for the MAX98357A (pins / SD_MODE / gain from the schematic); implement `IAudioAlert` (tone synthesis, non-blocking); check loudness and tone distinctness in flight noise | Components/Output/Audio |
+| LED | Pins, count, colour (RGB?), polarity; implement `IStatusLed` reproducing `LedPatternScheduler::levelAt()` timing; daylight visibility | Components/Output/LED |
+| Battery in SOS | Implement `IPowerMonitor`; put battery mV into `SosRequest` (bit `sosvalid::Battery`) | Components/Power |
+| Timing / stack | Measure `crash_.update()` and an EmergencyAlert wake with DWT `CYCCNT`; read the stack high-water marks (`g_systemHealth.tasks[]`); the 3 KiB EmergencyAlert stack can likely be reduced after measurement | RTOS_TIMING_ANALYSIS.md 4d |
+
+
+## 17. BLE and Android companion (Milestone 7)
+
+The emergency task now uses the bounded M7 BLE bridge with an unconfigured production packet port. The Android app has a corresponding GATT client, and both protocol directions were exercised with simulated packets. The device schematic, module image, UART pin/flow-control mapping, GATT database, authenticated pairing and persistent incident namespace are required for physical acceptance. See [BLE hardware integration](BLE_ANDROID_HARDWARE_INTEGRATION.md) for the bench sequence and phone test matrix.

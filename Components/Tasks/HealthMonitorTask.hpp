@@ -24,6 +24,12 @@
 
 #include "Task.hpp"   // SoarOS
 
+#include "Algorithms/Attitude/AttitudeTypes.hpp"
+#include "Algorithms/Crash/CrashTypes.hpp"
+#include "Algorithms/Emergency/EmergencyTypes.hpp"
+#include "Algorithms/Safety/AlertTypes.hpp"
+#include "Algorithms/Navigation/NavigationTypes.hpp"
+#include "Algorithms/Landing/LandingSafetyTypes.hpp"
 #include "Processing/ProcessedSensorFrame.hpp"
 #include "Tasks/SystemHealth.hpp"
 #include "Tasks/TaskConfig.hpp"
@@ -67,6 +73,12 @@ private:
     Watched watched_[pg::kMaxWatchedTasks] = {};
     uint8_t watchedCount_ = 0u;
     pg::ProcessedSensorFrame frameCopy_{};   ///< ~0.5 KB: kept off the 2 KiB task stack
+    pg::AttitudeEstimate attitudeCopy_{};    ///< ~0.2 KB: likewise
+    pg::NavigationEstimate navigationCopy_{};   ///< ~0.3 KB: likewise
+    pg::SafetySnapshot safetyCopy_{};           ///< ~0.2 KB: likewise
+    pg::CrashReport crashCopy_{};               ///< ~0.2 KB: likewise
+    pg::EmergencyStatus emergencyCopy_{};       ///< ~0.2 KB: likewise
+    pg::DispatchStatus dispatchCopy_{};         ///< ~0.1 KB: likewise
 
     StackType_t stack_[TaskConfig::HEALTH_STACK_WORDS] = {};
     StaticTask_t tcb_{};

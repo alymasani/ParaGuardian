@@ -96,6 +96,13 @@ private:
         bool gyroUsable;
         bool gyroCalibrated;
         uint32_t lastRejectReasons;
+        // impact evidence since the last frame (reset by buildFrame)
+        float peakAccelNorm;
+        float peakGyroNorm;
+        uint32_t peakTimestampMs;
+        uint16_t samplesSinceFrame;
+        bool accelSaturatedSinceFrame;
+        bool gyroSaturatedSinceFrame;
     };
     struct BaroState {
         bool present;
@@ -118,6 +125,8 @@ private:
     struct LidarState {
         bool present;
         LidarSample sample;
+        uint32_t lastRejectReasons;      ///< reject::* bits of the newest REJECTED LiDAR sample
+        uint32_t lastRejectTimestampMs;  ///< its timestamp (valid if lastRejectReasons != 0)
     };
 
     bool fresh(SensorId id, uint32_t timestampMs, uint32_t nowMs) const;
