@@ -11,7 +11,7 @@ jobs:
   firmware-host-tests:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with: { submodules: recursive }
       - name: Host unit tests (ASan + UBSan)
         run: CXX=clang++ sh Tools/check.sh firmware
@@ -20,17 +20,19 @@ jobs:
   backend:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with: { python-version: "3.11" }
       - run: sh Tools/check.sh backend
       - run: sh Tools/check.sh decoder
   android:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "17" }
-      - uses: android-actions/setup-android@v3
+      # The ubuntu runner image already contains the Android SDK (ANDROID_HOME is set); the Android
+      # Gradle plugin installs any missing platform. android-actions/setup-android@v3 was removed: it
+      # failed asking sdkmanager for the obsolete 'tools' package.
       - name: JVM tests, lint, debug APK (includes the Kotlin -> Python backend end-to-end test)
         run: sh Tools/check.sh android
