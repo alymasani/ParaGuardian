@@ -71,6 +71,16 @@ SOURCES="
   $ROOT/Components/Algorithms/Safety/SafetyEventDispatcher.cpp
   $ROOT/Components/Output/Audio/AudioAlertScheduler.cpp
   $ROOT/Components/Output/LED/LedPatternScheduler.cpp
+  $ROOT/Components/Storage/EmergencyJournal.cpp
+  $ROOT/Components/Storage/LogRecords.cpp
+  $ROOT/Components/Storage/FlightLog.cpp
+  $ROOT/Components/Storage/StorageService.cpp
+  $ROOT/Components/Storage/FlightRecorder.cpp
+  $ROOT/Components/Power/PowerManager.cpp
+  $ROOT/Components/Output/Audio/PcmToneOutput.cpp
+  $ROOT/Components/Output/LED/GpioStatusLed.cpp
+  $ROOT/Components/Sensors/LSM6DSRX/Lsm6dsrxFifo.cpp
+  $ROOT/Components/Common/TaskSupervisor.cpp
 "
 TESTS="$(ls "$ROOT"/Tests/unit/*.cpp)"
 

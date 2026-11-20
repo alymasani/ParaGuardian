@@ -63,7 +63,7 @@ import java.time.Instant
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
-    private val guardian get() = (application as GuardianApplication).guardian
+    internal val guardian get() = (application as GuardianApplication).guardian
     private val permissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
         if (grants.values.any { !it }) guardian.banner("Permission declined. Related features may be unavailable.")
         else guardian.banner("Permissions updated.")
@@ -110,6 +110,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun stopMonitoring() {
+        guardian.setMonitoringRequested(false)
         val service = Intent(this, MonitoringService::class.java)
         stopService(service)
     }
@@ -179,6 +180,7 @@ class MainActivity : ComponentActivity() {
     private fun startMonitoring(address: String?) {
         if (address == null) return guardian.banner("Associate a device first.")
         if (!canConnect()) return guardian.banner("Grant Bluetooth permission first.")
+        guardian.setMonitoringRequested(true)
         try {
             startForegroundService(Intent(this, MonitoringService::class.java).putExtra("address", address))
         } catch (_: RuntimeException) {
@@ -216,8 +218,10 @@ class MainActivity : ComponentActivity() {
             Column(Modifier.padding(insets).padding(horizontal = 20.dp)) {
                 Spacer(Modifier.height(12.dp))
                 Text("ParaGuardian", style = MaterialTheme.typography.headlineMedium)
-                Text(if (s.simulation) "Simulation · No external messages"
-                    else if (s.monitoring) s.link.label else "Physical mode · Monitoring inactive",
+                Text(if (s.simulation) (if (s.simulationUsesBackend && s.internetDelivery)
+                        "Simulation · TEST incidents to the emergency server (never delivered live)"
+                        else "Simulation · No external messages")
+                    else s.monitorStatus(canConnect()).label,
                     color = MaterialTheme.colorScheme.primary)
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     tabs.forEach { name -> FilterChip(selected = tab == name, onClick = { tab = name },
@@ -257,9 +261,16 @@ class MainActivity : ComponentActivity() {
             Button(onClick = ::pickDevice, enabled = s.storageReady && !s.monitoring) { Text("Find and associate device") }
             Text(if (s.address == null) "No device selected" else "Android association saved")
             Button(onClick = {
-                if (s.monitoring) stopMonitoring() else startMonitoring(s.address)
-            }, enabled = s.monitoring || (s.storageReady && s.address != null)) {
-                Text(if (s.monitoring) "Stop monitoring" else "Start monitoring")
+                if (s.monitoring || s.monitoringRequested) stopMonitoring() else startMonitoring(s.address)
+            }, enabled = s.monitoring || s.monitoringRequested || (s.storageReady && s.address != null)) {
+                Text(if (s.monitoring || s.monitoringRequested) "Stop monitoring" else "Start monitoring")
+            }
+            val monitor = s.monitorStatus(canConnect())
+            Text(monitor.label)
+            if (monitor == MonitorStatus.USER_ACTION_REQUIRED || monitor == MonitorStatus.RECOVERY_PENDING) {
+                OutlinedButton(onClick = { startMonitoring(s.address) }, enabled = s.address != null) {
+                    Text("Resume monitoring")
+                }
             }
             Text("SMS contacts ready · ${s.contacts.count { it.eligible }}")
         }
@@ -463,7 +474,8 @@ class MainActivity : ComponentActivity() {
         Button(onClick = { guardian.template(template) }, enabled = s.storageReady && template != s.template) {
             Text("Save message footer")
         }
-        Text(if (s.simulation) "Delivery route · In-app mock provider" else "Delivery route · User-confirmed SMS")
+        Text(s.deliveryLabel)
+        DeliverySettings(s)
         OutlinedButton(onClick = { forgetDevice(s.address) }, enabled = s.address != null && !s.monitoring) {
             Text("Remove Android association")
         }
@@ -475,6 +487,34 @@ class MainActivity : ComponentActivity() {
             dismissButton = { TextButton(onClick = { clear = false }) { Text("Keep") } })
         Text("Troubleshooting · Check Bluetooth and notification permissions. Reopen the app to restart monitoring after reboot or process termination.")
     }
+}
+
+@Composable
+private fun MainActivity.DeliverySettings(s: ViewState) {
+    HorizontalDivider()
+    Text("Unattended emergency delivery", style = MaterialTheme.typography.titleMedium)
+    Text("Sends SOS requests over HTTPS to your ParaGuardian emergency server, which messages your consented contacts. " +
+        "Provider acceptance is not delivery; only a provider delivery report is shown as delivered.",
+        style = MaterialTheme.typography.bodySmall)
+    var url by rememberSaveable { mutableStateOf("") }
+    var device by rememberSaveable { mutableStateOf("") }
+    var secret by remember { mutableStateOf("") }   // never saved in UI state
+    OutlinedTextField(url, { url = it.take(200) }, label = { Text("Server URL (https://…)") })
+    OutlinedTextField(device, { device = it.take(64) }, label = { Text("Device id") })
+    OutlinedTextField(secret, { secret = it.take(128) }, label = { Text("Device secret (hex)") },
+        visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation())
+    Row {
+        Button(onClick = { guardian.saveBackend(url, device, secret); secret = "" },
+            enabled = s.storageReady && url.isNotBlank() && device.isNotBlank() && secret.isNotBlank()) {
+            Text("Save credentials")
+        }
+        TextButton(onClick = { guardian.clearBackend() }, enabled = s.backendConfigured) { Text("Remove") }
+    }
+    Toggle("Use the emergency server for real incidents", s.internetDelivery, s.storageReady && s.backendConfigured) {
+        guardian.configureDelivery(it, s.simulationUsesBackend)
+    }
+    Toggle("Simulation sends TEST incidents to the server", s.simulationUsesBackend,
+        s.storageReady && s.backendConfigured) { guardian.configureDelivery(s.internetDelivery, it) }
 }
 
 @Composable private fun Title(text: String) = Text(text, style = MaterialTheme.typography.titleLarge)

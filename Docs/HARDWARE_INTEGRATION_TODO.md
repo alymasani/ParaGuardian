@@ -226,3 +226,17 @@ explicitly UNCONFIGURED (`UnconfiguredSosTransport`, `UnconfiguredAudioAlert`, `
 ## 17. BLE and Android companion (Milestone 7)
 
 The emergency task now uses the bounded M7 BLE bridge with an unconfigured production packet port. The Android app has a corresponding GATT client, and both protocol directions were exercised with simulated packets. The device schematic, module image, UART pin/flow-control mapping, GATT database, authenticated pairing and persistent incident namespace are required for physical acceptance. See [BLE hardware integration](BLE_ANDROID_HARDWARE_INTEGRATION.md) for the bench sequence and phone test matrix.
+
+## 18. Persistence, logging, power, outputs, FIFO, watchdog (Milestone 8)
+
+The portable code is implemented and host-tested. The firmware still runs `UnconfiguredNorFlash`,
+`UnconfiguredPowerSwitch` (5 V rail and amplifier), `UnconfiguredAudioAlert` and `UnconfiguredStatusLed`. Battery
+thresholds are unset, so the level is Unknown. The LSM6DSRX FIFO is not enabled and the IWDG is not enabled.
+Every item needing the schematic or measurements is listed in
+[MILESTONE8_HARDWARE_BRINGUP.md](MILESTONE8_HARDWARE_BRINGUP.md):
+- flash SPI and chip select, erase and program timing, and a 1,000-cycle power-cut test;
+- battery divider, ADC and chemistry thresholds; charger pin polarity;
+- regulator and amplifier enable polarity and settle times; SAI/I2S and DMA;
+- LED pins; FIFO registers and INT pins;
+- IWDG timeout; on-target stacks and timing;
+- the phone device matrix; the real provider setup and the safe live test.

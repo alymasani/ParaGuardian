@@ -63,8 +63,16 @@ class MonitoringService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val address = intent?.getStringExtra("address")
-        if (intent?.action == "stop" || address == null) {
+        val settings = Settings(this)
+        if (intent?.action == "stop") {   // the user stopped monitoring from the notification
+            guardian.setMonitoringRequested(false)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        // A null intent is Android re-creating this START_STICKY service after the process was killed:
+        // resume from the persisted request instead of silently giving up.
+        val address = intent?.getStringExtra("address") ?: settings.address?.takeIf { settings.monitoringRequested }
+        if (address == null) {
             stopSelf()
             return START_NOT_STICKY
         }
@@ -74,22 +82,29 @@ class MonitoringService : Service() {
             if (Build.VERSION.SDK_INT >= 29)
                 startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
             else startForeground(1, notification)
-            if (!guardian.monitor(address)) stopSelf()
-            else {
-                observation?.cancel()
-                observation = CoroutineScope(Dispatchers.Main.immediate).launch {
-                    guardian.state.map { it.link }.distinctUntilChanged().collect {
-                        if (it == LinkState.PERMISSION) stopSelf()
-                        else notifications.updateMonitoring(it.label)
-                    }
+            if (!guardian.monitor(address)) {
+                stopSelf()
+                return START_NOT_STICKY
+            }
+            settings.recoveryPending = false
+            observation?.cancel()
+            observation = CoroutineScope(Dispatchers.Main.immediate).launch {
+                guardian.state.map { it.link }.distinctUntilChanged().collect {
+                    if (it == LinkState.PERMISSION) stopSelf()   // request kept: the UI shows "permission required"
+                    else notifications.updateMonitoring(it.label)
                 }
             }
         } catch (_: RuntimeException) {
-            guardian.banner("Android denied background monitoring. Open the app and check permissions.")
+            settings.recoveryPending = true
+            guardian.banner("Android denied background monitoring. Open the app and tap Resume.")
             stopSelf()
+            return START_NOT_STICKY
         }
-        return START_NOT_STICKY
+        return START_STICKY
     }
+
+    /** Swiping the app away from Recents does not end monitoring (it is a foreground service). */
+    override fun onTaskRemoved(rootIntent: Intent?) = Unit
 
     override fun onDestroy() {
         observation?.cancel()

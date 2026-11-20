@@ -20,6 +20,8 @@ constexpr float kNaN = std::numeric_limits<float>::quiet_NaN();
 constexpr uint32_t kOverrunToleranceMs = 100u;
 /// Barometric altitude / vertical speed older than this are not put into an SOS request.
 constexpr uint32_t kNavMaxAgeMs = 5000u;
+/// A battery reading older than this is not put into an SOS request.
+constexpr uint32_t kBatteryMaxAgeMs = 30000u;
 
 void inc(uint32_t& c)
 {
@@ -50,15 +52,47 @@ EmergencyManager::EmergencyManager(const EmergencyConfig& cfg, ISosTransport& tr
 // ---------------------------------------------------------------------------
 void EmergencyManager::restore(uint32_t nowMs)
 {
+    nowCache_ = nowMs;
     persistent_ = store_ != nullptr && store_->available();
-    if (!persistent_) return;   // flags already say: not persistent, ids volatile
+    if (!persistent_) {
+        st_.persist = PersistState::Disabled;
+        st_.nextIncidentId = nextIncidentId_;
+        return;   // flags already say: not persistent, ids volatile
+    }
     st_.flags &= ~static_cast<uint32_t>(emflag::PersistenceUnavailable | emflag::IncidentIdVolatile);
+    st_.persist = PersistState::Committed;
 
     uint8_t buf[kEmergencyRecordBytes] = {};
     EmergencyPersistRecord r{};
-    if (!store_->load(buf, sizeof(buf)) || !decodeEmergencyRecord(buf, sizeof(buf), r)) return;   // nothing / corrupt
-    nextIncidentId_ = r.nextIncidentId != 0u ? r.nextIncidentId : 1u;
-    if (!valid_ || r.incidentId == 0u || r.state == EmergencyState::Idle || r.state == EmergencyState::Unavailable) {
+    const bool have = store_->load(buf, sizeof(buf)) && decodeEmergencyRecord(buf, sizeof(buf), r);
+
+    // ---- incident identity: never hand out an id a previous boot may have used ----
+    uint32_t next = 1u;
+    auto atLeast = [&next](uint32_t nextId, uint32_t usedId) {
+        if (nextId > next) next = nextId;
+        if (usedId != 0u && usedId != UINT32_MAX && usedId + 1u > next) next = usedId + 1u;
+    };
+    if (have) {
+        atLeast(r.nextIncidentId, r.incidentId);
+        identityFlags_ = r.identityFlags;
+        committedNextId_ = next;
+    }
+    EmergencyPersistRecord u{};
+    uint8_t ubuf[kEmergencyRecordBytes] = {};
+    if (store_->loadUncommitted(ubuf, sizeof(ubuf)) && decodeEmergencyRecord(ubuf, sizeof(ubuf), u)) {
+        atLeast(u.nextIncidentId, u.incidentId);   // torn commit: its ids may have been shown
+    }
+    if (store_->mountState() == StoreMount::Corrupt && !have) {
+        identityFlags_ |= identityflag::Uncertain;   // previous ids unknown: say so in every request
+    }
+    nextIncidentId_ = next;
+    if ((identityFlags_ & identityflag::Uncertain) != 0u) st_.flags |= emflag::IdentityUncertain;
+    if ((identityFlags_ & identityflag::Exhausted) != 0u) st_.flags |= emflag::IdentityExhausted;
+
+    if (!have || !valid_ || r.incidentId == 0u || r.state == EmergencyState::Idle ||
+        r.state == EmergencyState::Unavailable) {
+        persist();   // boot record: commits the identity floor before any incident can use it
+        st_.nextIncidentId = nextIncidentId_;
         return;
     }
 
@@ -74,9 +108,19 @@ void EmergencyManager::restore(uint32_t nowMs)
     st_.cancelNotice = r.cancelNotice;
     st_.flags |= emflag::RestoredAfterReset;
     eventMs_ = nowMs;
+    holdStartMs_ = nowMs;
     switch (r.state) {
         case EmergencyState::Countdown: {
-            // The time spent in reset is unknown: restart the FULL countdown (the pilot can still cancel).
+            // The MCU clock does not run while powered off: the time spent in reset is UNKNOWN.
+            // Policy: restart the FULL countdown (the pilot can still cancel a false alarm), but
+            // only maxCountdownRestarts times: a reset loop must not postpone help forever.
+            st_.countdownRestarts = static_cast<uint8_t>(r.countdownRestarts == UINT8_MAX ? UINT8_MAX
+                                                                                          : r.countdownRestarts + 1u);
+            if (st_.countdownRestarts > cfg_.maxCountdownRestarts) {
+                st_.flags |= emflag::RepeatedResetEscalated;
+                createRequest(nowMs);   // persists
+                break;
+            }
             const uint32_t total = r.trigger == IncidentTrigger::Manual ? cfg_.manualCountdownMs : cfg_.autoCountdownMs;
             st_.countdownTotalMs = total;
             countdownDeadlineMs_ = nowMs + total;
@@ -89,7 +133,8 @@ void EmergencyManager::restore(uint32_t nowMs)
         case EmergencyState::AwaitingPhoneAck:
         case EmergencyState::AwaitingDelivery:
         case EmergencyState::DeliveryUnknown:
-            // Re-send (idempotent: same incident id, next revision).
+            // Re-send (idempotent: same incident id, next revision). The phone / backend
+            // de-duplicate on (device, incident id); a newer revision only updates content.
             buildRequest(SosRequestKind::Alert, nowMs);
             st_.attempts = 0u;
             st_.cycles = 1u;
@@ -111,6 +156,20 @@ void EmergencyManager::restore(uint32_t nowMs)
             break;
     }
     persist();
+    st_.nextIncidentId = nextIncidentId_;
+}
+
+bool EmergencyManager::identityDurable(uint32_t incidentId) const
+{
+    return persistent_ && incidentId != 0u && committedNextId_ > incidentId;
+}
+
+void EmergencyManager::observeBattery(uint16_t millivolts, bool valid, uint32_t nowMs)
+{
+    batteryValid_ = valid && millivolts != 0u;
+    batteryMv_ = batteryValid_ ? millivolts : 0u;
+    batteryMs_ = nowMs;
+    st_.batteryMillivolts = batteryMv_;
 }
 
 // ---------------------------------------------------------------------------
@@ -155,12 +214,60 @@ void EmergencyManager::persist()
     r.requestLeftDevice = st_.requestLeftDevice;
     r.cancelledAfterSend = st_.cancelledAfterSend;
     r.cancelNotice = st_.cancelNotice;
+    r.countdownRestarts = st_.countdownRestarts;
+    r.identityFlags = identityFlags_;
     uint8_t buf[kEmergencyRecordBytes];
     const size_t n = encodeEmergencyRecord(r, buf, sizeof(buf));
-    if (n != 0u && store_->save(buf, n)) {
+    uint32_t ticket = 0u;
+    const PersistAck ack = n != 0u ? store_->save(buf, n, ticket) : PersistAck::Rejected;
+    switch (ack) {
+        case PersistAck::Committed:
+            inc(st_.persistenceWrites);
+            committedNextId_ = nextIncidentId_;
+            persistOutstanding_ = false;
+            pendingTicket_ = ticket;
+            st_.persist = PersistState::Committed;
+            st_.flags &= ~static_cast<uint32_t>(emflag::PersistencePending | emflag::PersistenceDegraded);
+            break;
+        case PersistAck::Queued:
+            if (!persistOutstanding_) persistQueuedMs_ = nowCache_;
+            persistOutstanding_ = true;
+            pendingTicket_ = ticket;
+            savedNextIdTicket_ = ticket;
+            savedNextId_ = nextIncidentId_;
+            if (st_.persist != PersistState::Failed) st_.persist = PersistState::Pending;
+            st_.flags |= emflag::PersistencePending;
+            break;
+        case PersistAck::Rejected:
+        default:
+            inc(st_.persistenceFailures);
+            st_.persist = PersistState::Failed;
+            st_.flags |= emflag::PersistenceDegraded;
+            break;
+    }
+}
+
+void EmergencyManager::pollPersistence(uint32_t nowMs)
+{
+    if (!persistent_ || !persistOutstanding_) return;
+    const uint32_t committed = store_->committedTicket();
+    if (committed != 0u && timebase::diffMs(committed, savedNextIdTicket_) >= 0 && savedNextIdTicket_ != 0u) {
+        if (savedNextId_ > committedNextId_) committedNextId_ = savedNextId_;
+    }
+    if (committed != 0u && timebase::diffMs(committed, pendingTicket_) >= 0) {
+        persistOutstanding_ = false;
         inc(st_.persistenceWrites);
-    } else {
+        const uint32_t latency = elapsed(nowMs, persistQueuedMs_);
+        if (latency > st_.persistLatencyMaxMs) st_.persistLatencyMaxMs = latency;
+        st_.persist = PersistState::Committed;
+        st_.flags &= ~static_cast<uint32_t>(emflag::PersistencePending | emflag::PersistenceDegraded);
+        return;
+    }
+    const uint32_t failed = store_->failedTicket();
+    if (failed != 0u && timebase::diffMs(failed, pendingTicket_) >= 0 && st_.persist != PersistState::Failed) {
         inc(st_.persistenceFailures);
+        st_.persist = PersistState::Failed;   // the store keeps retrying; a later commit clears this
+        st_.flags |= emflag::PersistenceDegraded;
     }
 }
 
@@ -205,7 +312,17 @@ PendingSosRecord EmergencyManager::pendingRecord() const
 void EmergencyManager::openIncident(IncidentTrigger trigger, uint32_t crashEpisode, uint32_t nowMs)
 {
     st_.incidentId = nextIncidentId_;
-    nextIncidentId_ = nextIncidentId_ == UINT32_MAX ? 1u : nextIncidentId_ + 1u;   // 0 is never an incident id
+    if (nextIncidentId_ >= UINT32_MAX - 1u) {
+        // 32-bit id space used up (unreachable in practice: ~4e9 incidents). Wrapping would
+        // repeat ids the phone / backend already know, so every later request says so.
+        identityFlags_ |= identityflag::Exhausted;
+        st_.flags |= emflag::IdentityExhausted;
+        nextIncidentId_ = 1u;
+    } else {
+        ++nextIncidentId_;   // 0 is never an incident id
+    }
+    st_.nextIncidentId = nextIncidentId_;
+    st_.countdownRestarts = 0u;
     st_.trigger = trigger;
     st_.crashEpisodeId = crashEpisode;
     st_.requestRevision = 0u;
@@ -219,7 +336,8 @@ void EmergencyManager::openIncident(IncidentTrigger trigger, uint32_t crashEpiso
     st_.additionalImpacts = 0u;
     st_.countdownOverrunMs = 0u;
     st_.flags &= ~static_cast<uint32_t>(emflag::RestoredAfterReset | emflag::ProvenanceIncomplete |
-                                        emflag::ManuallyConfirmed | emflag::CountdownOverrun);
+                                        emflag::ManuallyConfirmed | emflag::CountdownOverrun |
+                                        emflag::IdentityUnconfirmed | emflag::RepeatedResetEscalated);
     req_ = SosRequest{};
     eventMs_ = nowMs;
     if (trigger == IncidentTrigger::Manual) {
@@ -304,9 +422,16 @@ void EmergencyManager::buildRequest(SosRequestKind kind, uint32_t nowMs)
         r.crashEvidence = crashEvidence_;
         if (impact_.saturated) v |= sosvalid::ImpactSaturated;
     }
-    if (!persistent_) v |= sosvalid::IncidentIdVolatile;
+    if (!persistent_ || identityFlags_ != 0u || (st_.flags & emflag::IdentityUnconfirmed) != 0u) {
+        v |= sosvalid::IncidentIdVolatile;
+    }
     if ((st_.flags & emflag::RestoredAfterReset) != 0u) v |= sosvalid::Restored;
-    r.batteryMillivolts = 0u;   // no power monitor implemented: unknown, Battery bit clear
+    if (batteryValid_ && elapsed(nowMs, batteryMs_) <= kBatteryMaxAgeMs) {
+        v |= sosvalid::Battery;
+        r.batteryMillivolts = batteryMv_;
+    } else {
+        r.batteryMillivolts = 0u;   // unknown: Battery bit clear (never invented)
+    }
     r.deviceHealthFlags = ctx_.frameQualityFlags;
     r.validity = v;
 }
@@ -314,6 +439,7 @@ void EmergencyManager::buildRequest(SosRequestKind kind, uint32_t nowMs)
 void EmergencyManager::createRequest(uint32_t nowMs)
 {
     st_.requestIssued = true;
+    holdStartMs_ = nowMs;
     enter(EmergencyState::SosPending, nowMs);
     buildRequest(SosRequestKind::Alert, nowMs);
     markStage(DeliveryStage::Created, stagebit::Created);
@@ -386,6 +512,7 @@ void EmergencyManager::setTransportUnavailable(bool unavailable, uint32_t nowMs)
 // ---------------------------------------------------------------------------
 void EmergencyManager::observeCrash(const CrashReport& report, uint32_t nowMs)
 {
+    nowCache_ = nowMs;
     if (!valid_) return;
     const CrashStatus& c = report.status;
     ctx_ = report.context;
@@ -431,6 +558,7 @@ void EmergencyManager::observeCrash(const CrashReport& report, uint32_t nowMs)
 
 CommandResult EmergencyManager::handleCommand(const EmergencyCommand& c, uint32_t nowMs)
 {
+    nowCache_ = nowMs;
     if (!isWellFormed(c)) {
         inc(st_.commandsRejected);
         return CommandResult::Malformed;
@@ -514,6 +642,7 @@ CommandResult EmergencyManager::handleCommand(const EmergencyCommand& c, uint32_
 
 void EmergencyManager::handleReport(const TransportReport& r, uint32_t nowMs)
 {
+    nowCache_ = nowMs;
     if (!valid_) return;
     if (r.kind == TransportReportKind::None || r.kind >= TransportReportKind::Count) {
         inc(st_.invalidReports);
@@ -703,6 +832,16 @@ void EmergencyManager::serviceTransport(uint32_t nowMs)
         nextAttemptMs_ = nowMs + cfg_.linkPollMs;
         return;
     }
+    // (Exhausted id space: ids repeat by definition and every request says so; waiting is pointless.)
+    if (!st_.requestLeftDevice && persistent_ && (identityFlags_ & identityflag::Exhausted) == 0u &&
+        !identityDurable(st_.incidentId)) {
+        // First transmission of this incident: wait (bounded) until its id is durable, so a
+        // reset cannot give the same id to a different incident. Never withhold help: after
+        // identityHoldMs the request goes out marked IncidentIdVolatile.
+        if (elapsed(nowMs, holdStartMs_) < cfg_.identityHoldMs && st_.persist != PersistState::Failed) return;
+        st_.flags |= emflag::IdentityUnconfirmed;
+        req_.validity = static_cast<uint16_t>(req_.validity | sosvalid::IncidentIdVolatile);
+    }
     req_.state = st_.state;
     switch (transport_.submit(req_, nowMs)) {
         case TransportSubmitResult::Accepted:
@@ -739,6 +878,8 @@ const EmergencyStatus& EmergencyManager::tick(uint32_t nowMs)
 {
     if (st_.sequence != UINT32_MAX) ++st_.sequence;
     st_.timestampMs = nowMs;
+    nowCache_ = nowMs;
+    pollPersistence(nowMs);
     if (!valid_) {
         st_.state = EmergencyState::Unavailable;
         return st_;
@@ -789,6 +930,7 @@ const EmergencyStatus& EmergencyManager::tick(uint32_t nowMs)
         const int32_t left = timebase::diffMs(nextAttemptMs_, nowMs);
         st_.nextAttemptInMs = left > 0 ? static_cast<uint32_t>(left) : 0u;
     }
+    st_.nextIncidentId = nextIncidentId_;
     return st_;
 }
 

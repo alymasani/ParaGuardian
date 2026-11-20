@@ -32,6 +32,9 @@
 #include "Algorithms/Landing/LandingSafetyTypes.hpp"
 #include "Processing/ProcessedSensorFrame.hpp"
 #include "Tasks/SystemHealth.hpp"
+#include "Common/TaskSupervisor.hpp"
+#include "Power/PowerManager.hpp"
+#include "Storage/StorageService.hpp"
 #include "Tasks/TaskConfig.hpp"
 
 enum HEALTH_TASK_COMMANDS : uint16_t {
@@ -79,6 +82,10 @@ private:
     pg::CrashReport crashCopy_{};               ///< ~0.2 KB: likewise
     pg::EmergencyStatus emergencyCopy_{};       ///< ~0.2 KB: likewise
     pg::DispatchStatus dispatchCopy_{};         ///< ~0.1 KB: likewise
+    pg::StorageStatus storageCopy_{};
+    pg::PowerSnapshot powerCopy_{};
+    pg::TaskSupervisor supervisor_{};
+    int supAcq_ = -1, supProc_ = -1, supEmergency_ = -1, supStorage_ = -1;
 
     StackType_t stack_[TaskConfig::HEALTH_STACK_WORDS] = {};
     StaticTask_t tcb_{};

@@ -1,6 +1,9 @@
 package org.paraguardian.companion
 
+import android.annotation.SuppressLint
 import android.content.ContentValues
+import android.content.SharedPreferences
+import androidx.core.database.sqlite.transaction
 import android.content.Context
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
@@ -9,7 +12,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 class IncidentDatabase(context: Context, name: String = "incidents.db") :
-    SQLiteOpenHelper(context, name, null, 1), IncidentStore {
+    SQLiteOpenHelper(context, name, null, 2), IncidentStore, OutboxStore {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
             """CREATE TABLE incidents (
@@ -26,6 +29,18 @@ class IncidentDatabase(context: Context, name: String = "incidents.db") :
                 at INTEGER NOT NULL, revision INTEGER NOT NULL, stage TEXT NOT NULL, cancelled INTEGER NOT NULL)"""
         )
         db.execSQL("CREATE INDEX incident_events_key ON incident_events(device, incident)")
+        createOutbox(db)
+    }
+
+    /** Version 2 (Milestone 8): durable outbox for internet delivery. */
+    private fun createOutbox(db: SQLiteDatabase) {
+        db.execSQL(
+            """CREATE TABLE outbox (
+                device TEXT NOT NULL, incident INTEGER NOT NULL, incident_key TEXT NOT NULL, revision INTEGER NOT NULL,
+                kind TEXT NOT NULL, body TEXT NOT NULL, test INTEGER NOT NULL, state TEXT NOT NULL,
+                attempts INTEGER NOT NULL, next_attempt INTEGER NOT NULL, overall TEXT, last_error TEXT,
+                created INTEGER NOT NULL, PRIMARY KEY (device, incident))"""
+        )
     }
 
     override fun onConfigure(db: SQLiteDatabase) {
@@ -33,8 +48,33 @@ class IncidentDatabase(context: Context, name: String = "incidents.db") :
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        error("Missing incident database migration $oldVersion to $newVersion")
+        if (oldVersion == 1 && newVersion == 2) createOutbox(db)   // existing incidents are kept untouched
+        else error("Missing incident database migration $oldVersion to $newVersion")
     }
+
+    override fun outbox(key: Key): OutboxItem? = readableDatabase.query(
+        "outbox", null, "device=? AND incident=?", arrayOf(key.device, key.incident.toString()), null, null, null
+    ).use { if (it.moveToFirst()) it.outboxItem() else null }
+
+    override fun putOutbox(item: OutboxItem) {
+        val values = ContentValues().apply {
+            put("device", item.key.device); put("incident", item.key.incident); put("incident_key", item.incidentKey)
+            put("revision", item.revision); put("kind", item.kind); put("body", item.body); put("test", item.test)
+            put("state", item.state.name); put("attempts", item.attempts); put("next_attempt", item.nextAttemptAt)
+            put("overall", item.overall); put("last_error", item.lastError); put("created", item.createdAt)
+        }
+        check(writableDatabase.insertWithOnConflict("outbox", null, values, SQLiteDatabase.CONFLICT_REPLACE) != -1L)
+    }
+
+    override fun outboxItems(): List<OutboxItem> = readableDatabase.query(
+        "outbox", null, null, null, null, null, "created"
+    ).use { c -> buildList { while (c.moveToNext()) add(c.outboxItem()) } }
+
+    private fun Cursor.outboxItem() = OutboxItem(
+        Key(getString(0), getLong(1)), getString(2), getInt(3), getString(4), getString(5), getInt(6) != 0,
+        OutboxState.valueOf(getString(7)), getInt(8), getLong(9), if (isNull(10)) null else getString(10),
+        if (isNull(11)) null else getString(11), getLong(12)
+    )
 
     override fun get(key: Key): Record? = readableDatabase.query(
         "incidents", null, "device=? AND incident=?", arrayOf(key.device, key.incident.toString()),
@@ -43,9 +83,8 @@ class IncidentDatabase(context: Context, name: String = "incidents.db") :
 
     override fun put(record: Record) {
         val selection = arrayOf(record.key.device, record.key.incident.toString())
-        val db = writableDatabase
-        db.beginTransaction()
-        try {
+        writableDatabase.transaction {
+            val db = this
             val prior = db.query("incidents", arrayOf("hidden", "revision", "stage", "cancelled"),
                 "device=? AND incident=?", selection, null, null, null).use {
                 if (it.moveToFirst()) Prior(it.getInt(0) != 0, it.getInt(1), it.getString(2), it.getInt(3) != 0)
@@ -84,9 +123,6 @@ class IncidentDatabase(context: Context, name: String = "incidents.db") :
                     put("cancelled", record.cancelledNotice)
                 })
             }
-            db.setTransactionSuccessful()
-        } finally {
-            db.endTransaction()
         }
     }
 
@@ -107,7 +143,8 @@ class IncidentDatabase(context: Context, name: String = "incidents.db") :
         result
     }
 
-    override fun recoverable(): List<Record> = list("stage IN ('STORED','ATTEMPTING')")
+    override fun recoverable(): List<Record> =
+        list("stage IN ('STORED','ATTEMPTING','SUBMISSION_PENDING','SERVER_ACCEPTED')")
     fun visible(): List<Record> = list("hidden=0", "200")
 
     private fun list(selection: String?, limit: String? = null): List<Record> = readableDatabase.query(
@@ -123,14 +160,11 @@ class IncidentDatabase(context: Context, name: String = "incidents.db") :
             putNull("composer_targets")
             put("hidden", true)
         }
-        val db = writableDatabase
-        db.beginTransaction()
-        try {
-            db.update("incidents", values, where, args)
-            db.execSQL("DELETE FROM incident_events WHERE EXISTS (SELECT 1 FROM incidents i " +
+        writableDatabase.transaction {
+            update("incidents", values, where, args)
+            execSQL("DELETE FROM incident_events WHERE EXISTS (SELECT 1 FROM incidents i " +
                 "WHERE i.hidden=1 AND i.device=incident_events.device AND i.incident=incident_events.incident)")
-            db.setTransactionSuccessful()
-        } finally { db.endTransaction() }
+        }
     }
 
     private fun Cursor.record() = Record(
@@ -158,23 +192,46 @@ private fun JSONObject.position() = Position(
     optBoolean("acquired"), optLong("captured").takeIf { has("captured") }
 )
 
+/**
+ * Durable preference write: the KTX edit {} extension discards commit()'s result, but a failed
+ * write of monitoring / delivery settings must be detected, so the Boolean is checked here.
+ */
+@SuppressLint("UseKtx", "ApplySharedPref")
+private fun SharedPreferences.commitChange(block: SharedPreferences.Editor.() -> Unit) =
+    check(edit().apply(block).commit()) { "preference write failed" }
+
 class Settings(context: Context) {
     private val prefs = context.getSharedPreferences("setup_v1", Context.MODE_PRIVATE)
     var address: String?
         get() = prefs.getString("address", null)
-        set(value) { check(prefs.edit().putString("address", value).commit()) }
+        set(value) { prefs.commitChange { putString("address", value) } }
     var lastPhysicalConnection: Long
         get() = prefs.getLong("lastPhysicalConnection", 0L)
-        set(value) { check(prefs.edit().putLong("lastPhysicalConnection", value).commit()) }
+        set(value) { prefs.commitChange { putLong("lastPhysicalConnection", value) } }
     var simulation: Boolean
         get() = prefs.getBoolean("simulation", true)
-        set(value) { check(prefs.edit().putBoolean("simulation", value).commit()) }
+        set(value) { prefs.commitChange { putBoolean("simulation", value) } }
     var template: String
         get() = prefs.getString("template", "").orEmpty()
-        set(value) { check(prefs.edit().putString("template", value.take(160)).commit()) }
+        set(value) { prefs.commitChange { putString("template", value.take(160)) } }
     var safetyNotifications: Boolean
         get() = prefs.getBoolean("safetyNotifications", true)
-        set(value) { check(prefs.edit().putBoolean("safetyNotifications", value).commit()) }
+        set(value) { prefs.commitChange { putBoolean("safetyNotifications", value) } }
+
+    /** What the user ASKED for (persisted); whether monitoring actually runs is ViewState.monitoring. */
+    var monitoringRequested: Boolean
+        get() = prefs.getBoolean("monitoringRequested", false)
+        set(value) { prefs.commitChange { putBoolean("monitoringRequested", value) } }
+    /** Set when Android refused a background restart: the user must reopen the app. */
+    var recoveryPending: Boolean
+        get() = prefs.getBoolean("recoveryPending", false)
+        set(value) { prefs.commitChange { putBoolean("recoveryPending", value) } }
+    var internetDelivery: Boolean
+        get() = prefs.getBoolean("internetDelivery", false)
+        set(value) { prefs.commitChange { putBoolean("internetDelivery", value) } }
+    var simulationUsesBackend: Boolean
+        get() = prefs.getBoolean("simulationUsesBackend", false)
+        set(value) { prefs.commitChange { putBoolean("simulationUsesBackend", value) } }
 
     fun contacts(): List<Contact> {
         val list = JSONArray(prefs.getString("contacts", "[]"))
@@ -192,6 +249,6 @@ class Settings(context: Context) {
             list.put(JSONObject().put("name", c.name).put("number", c.number)
                 .put("enabled", c.enabled).put("consent", c.consent))
         }
-        check(prefs.edit().putString("contacts", list.toString()).commit())
+        prefs.commitChange { putString("contacts", list.toString()) }
     }
 }

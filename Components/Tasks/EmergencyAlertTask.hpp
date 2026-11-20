@@ -11,6 +11,9 @@
  *   any task --submitCommand()--> BoundedInbox<EmergencyCommand, 8>  (+ notify)
  *   transport --submitTransportReport()--> BoundedInbox<TransportReport, 8>
  *   this task --> EmergencyManager --> ISosTransport (UNCONFIGURED in firmware)
+ *            --> JournaledEmergencyStore (queued; StorageTask commits it to flash)
+ *            --> FlightRecorder (events / emergency / power records -> StorageTask)
+ *            --> PowerManager (battery, 5 V rail, amplifier; switches UNCONFIGURED)
  *            --> SafetyEventDispatcher --> AudioAlertScheduler (UNCONFIGURED backend)
  *                                     --> LedPatternScheduler (UNCONFIGURED backend)
  *            --> emergency() / sosRequest() / dispatch() latest-value mailboxes
@@ -46,6 +49,7 @@
 #include "Algorithms/Safety/ValueMailbox.hpp"
 #include "Output/Audio/AudioAlertScheduler.hpp"
 #include "Output/LED/LedPatternScheduler.hpp"
+#include "Power/PowerManager.hpp"
 #include "Tasks/RtosCriticalSection.hpp"
 #include "Tasks/TaskConfig.hpp"
 
@@ -79,6 +83,7 @@ public:
     const pg::SosRequestMailbox& sosRequest() const { return sosOut_; }
     const pg::ValueMailbox<pg::ble::Diagnostics>& bleDiagnostics() const { return bleOut_; }
     const pg::ValueMailbox<pg::DispatchStatus>& dispatch() const { return dispatchOut_; }
+    const pg::ValueMailbox<pg::PowerSnapshot>& power() const { return powerOut_; }
     uint32_t commandsDropped() const { return commands_.dropped(); }
     uint32_t reportsDropped() const { return reports_.dropped(); }
     uint32_t localEventBacklog() const { return static_cast<uint32_t>(localEvents_.size()); }
@@ -97,9 +102,11 @@ private:
     // Backends: honestly UNCONFIGURED until the schematic / CYW20822 protocol / flash are verified.
     pg::ble::UnconfiguredPacketPort packetPort_{};
     pg::ble::EmergencyBridge transport_{packetPort_};
-    pg::NullEmergencyStore store_{};
     pg::UnconfiguredAudioAlert audioBackend_{};
     pg::UnconfiguredStatusLed ledBackend_{};
+    pg::UnconfiguredPowerSwitch rail5vSwitch_{};      ///< enable pin / polarity unknown
+    pg::UnconfiguredPowerSwitch amplifierSwitch_{};
+    pg::PowerManager power_;                          ///< battery thresholds unconfigured -> level Unknown
 
     pg::EmergencyManager manager_;
     pg::SafetyEventDispatcher dispatcher_;
@@ -118,6 +125,8 @@ private:
     pg::SosRequestMailbox sosOut_;
     pg::RtosCriticalSection dispatchLock_{};
     pg::ValueMailbox<pg::DispatchStatus> dispatchOut_;
+    pg::ValueMailbox<pg::PowerSnapshot> powerOut_;
+    uint32_t lastPowerMs_ = 0u;
 
     pg::CrashReport crashCopy_{};        ///< ~0.2 KB, kept off the stack
     pg::SafetySnapshot safetyCopy_{};    ///< ~0.2 KB

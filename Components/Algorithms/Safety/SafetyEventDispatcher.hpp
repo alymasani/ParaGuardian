@@ -42,6 +42,7 @@ struct DispatcherConfig {
     uint32_t transientHoldMs = 2000u;    ///< a raised-then-cleared warning still sounds this long
     uint32_t countdownFinalMs = 10000u;  ///< faster countdown beeps in the last seconds
     uint32_t acceptedShowMs = 30000u;    ///< SosAccepted information shown this long
+    uint32_t phoneLossMs = 10000u;       ///< in flight, link down this long -> PhoneDisconnected
     bool isValid() const { return snapshotMaxAgeMs > 0u && staleHoldMs > 0u && transientHoldMs > 0u; }
 };
 
@@ -60,6 +61,8 @@ public:
 
     /// One event (popped from a queue). Bounded work.
     void consume(const SafetyEvent& e, uint32_t nowMs);
+    /// Battery / phone link / storage / supervisor state (latest values). Optional: never set = no such alerts.
+    void setSystemInputs(const SystemAlertInputs& in, uint32_t nowMs);
     /// Pilot acknowledgment: silences the audio of the current alert episode if allowed.
     void acknowledge(uint32_t nowMs);
     /// Re-evaluates alerts and advances the output schedulers.
@@ -93,6 +96,10 @@ private:
     uint32_t lastEventId_[2] = {};                ///< [0] processing emitter, [1] emergency emitter
     uint32_t lastSafetyChangeMs_ = 0u;
     bool safetyEverSeen_ = false;
+    SystemAlertInputs sys_{};
+    bool haveSys_ = false;
+    bool linkEverUp_ = false;
+    uint32_t linkDownSinceMs_ = 0u;
     AlertKind lastAudioAlert_ = AlertKind::None;
     uint8_t lastAudioPriority_ = 0u;
 };

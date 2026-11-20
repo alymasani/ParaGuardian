@@ -62,6 +62,10 @@ public:
     CommandResult handleCommand(const EmergencyCommand& cmd, uint32_t nowMs);
     void handleReport(const TransportReport& report, uint32_t nowMs);
     const EmergencyStatus& tick(uint32_t nowMs);
+    /// Latest battery reading (PowerManager). Put into SOS requests while recent; 0 / invalid = unknown.
+    void observeBattery(uint16_t millivolts, bool valid, uint32_t nowMs);
+    /// True once the record that holds @p incidentId as used (nextIncidentId > id) is COMMITTED.
+    bool identityDurable(uint32_t incidentId) const;
 
     const EmergencyStatus& status() const { return st_; }
     PendingSosRecord pendingRecord() const;
@@ -81,6 +85,7 @@ private:
     void setTransportUnavailable(bool unavailable, uint32_t nowMs);
     void emit(SafetyEventType type, SafetyTransition tr, SafetySeverity sev, SafetySeverity prev, uint32_t nowMs);
     void persist();
+    void pollPersistence(uint32_t nowMs);
     uint32_t backoffMs(uint8_t failedAttempts) const;
     bool sendingActive() const;
     bool awaitingAck() const;
@@ -98,6 +103,19 @@ private:
     uint32_t crashEvidence_ = 0u;
 
     uint32_t nextIncidentId_ = 1u;
+    uint8_t identityFlags_ = 0u;          ///< identityflag::* (sticky, persisted)
+    // durability tracking (IEmergencyStore tickets)
+    uint32_t pendingTicket_ = 0u;         ///< newest ticket handed to the store
+    bool persistOutstanding_ = false;
+    uint32_t persistQueuedMs_ = 0u;
+    uint32_t savedNextIdTicket_ = 0u;     ///< ticket of the newest save (with savedNextId_)
+    uint32_t savedNextId_ = 0u;
+    uint32_t committedNextId_ = 0u;       ///< nextIncidentId in the newest COMMITTED record (0 = none)
+    uint32_t holdStartMs_ = 0u;           ///< identity hold of the first transmission started
+    uint32_t nowCache_ = 0u;
+    uint16_t batteryMv_ = 0u;
+    uint32_t batteryMs_ = 0u;
+    bool batteryValid_ = false;
     uint32_t countdownDeadlineMs_ = 0u;
     uint32_t eventMs_ = 0u;            ///< incident time (impact / command)
     uint32_t nextAttemptMs_ = 0u;

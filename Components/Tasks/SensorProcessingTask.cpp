@@ -13,6 +13,7 @@
 #include "Algorithms/Crash/CrashInputAdapter.hpp"
 #include "Algorithms/Safety/SafetyInput.hpp"
 #include "BSP/RtosClock.hpp"
+#include "Tasks/StorageTask.hpp"
 
 SensorProcessingTask::SensorProcessingTask()
     : Task(0u),  // no SoarOS command queue: data arrives through queue_
@@ -127,6 +128,24 @@ void SensorProcessingTask::Run(void* /*pvParams*/)
         crashReport_.context = incident_;
         crashReport_.publishedMs = clock.millis();
         crashOut_.publish(crashReport_);
+
+        // Flight recorder (Milestone 8): rate-limited by the logging profile; only copies a few
+        // words into a bounded queue (never blocks; a full queue drops and counts the record).
+        {
+            pg::FlightRecorder& rec = StorageTask::Inst().recorder();
+            const uint32_t logNow = crashReport_.publishedMs;
+            rec.logNavigation(navigation_.latest(), logNow);
+            rec.logCrash(crashReport_.status, logNow);
+            pg::SensorQualitySummary q{};
+            q.qualityFlags = work_.qualityFlags;
+            q.accelStatus = static_cast<uint8_t>(work_.specificForce_mps2.status);
+            q.gyroStatus = static_cast<uint8_t>(work_.angularRate_radps.status);
+            q.baroStatus = static_cast<uint8_t>(work_.baroAltitude_m.status);
+            q.accelMask = work_.specificForce_mps2.contributingMask;
+            q.gyroMask = work_.angularRate_radps.contributingMask;
+            q.baroMask = work_.baroAltitude_m.contributingMask;
+            rec.logQuality(q, logNow);
+        }
 
         const uint32_t elapsed = clock.millis() - start;
         stats_.lastProcessingTimeMs = elapsed;   // includes attitude, navigation and safety updates

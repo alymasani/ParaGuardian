@@ -32,6 +32,10 @@ enum class AlertKind : uint8_t {
     SosCommFailure,      ///< transport unavailable, delivery failed or unknown
     CrashSuspected,
     SosCountdown,
+    // Milestone 8 (appended: existing values unchanged)
+    LowBattery,          ///< Caution: battery Low; Warning: battery Critical (PowerManager)
+    SystemFault,         ///< persistence degraded / storage fault / supervisor fault (advisory)
+    PhoneDisconnected,   ///< in flight, the phone link was lost (no SOS pending: SosCommFailure covers that)
     Count
 };
 constexpr uint8_t kAlertKindCount = static_cast<uint8_t>(AlertKind::Count);
@@ -64,6 +68,16 @@ enum class OutputState : uint8_t {
     Idle = 0,        ///< nothing to output
     Active,          ///< pattern running
     Unavailable,     ///< no backend / backend refuses (no hardware configured)
+};
+
+/// Non-safety-snapshot inputs of the dispatcher (latest values, set by the emergency task).
+struct SystemAlertInputs {
+    uint8_t batteryLevel;     ///< pg::BatteryLevel (0 Unknown, 1 Healthy, 2 Low, 3 Critical)
+    bool phoneLinkKnown;      ///< a phone transport exists (configured)
+    bool phoneLinkUp;
+    bool inFlight;
+    bool storageDegraded;     ///< emergency state not durable / storage faults
+    bool supervisorFault;     ///< a task missed its heartbeat (TaskSupervisor)
 };
 
 struct DispatchStatus {

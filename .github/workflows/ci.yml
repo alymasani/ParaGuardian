@@ -1,0 +1,36 @@
+# Hardware-free checks. The native STM32CubeIDE firmware build is NOT run here (the IDE is not
+# installable on hosted runners); it stays a local step: sh Tools/check.sh cubeide.
+# No secrets are used or needed: the backend tests use the fake provider over loopback only.
+name: ci
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  firmware-host-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - name: Host unit tests (ASan + UBSan)
+        run: CXX=clang++ sh Tools/check.sh firmware
+      - name: Host unit tests (ThreadSanitizer)
+        run: CXX=clang++ sh Tools/check.sh tsan
+  backend:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: sh Tools/check.sh backend
+      - run: sh Tools/check.sh decoder
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - uses: android-actions/setup-android@v3
+      - name: JVM tests, lint, debug APK (includes the Kotlin -> Python backend end-to-end test)
+        run: sh Tools/check.sh android

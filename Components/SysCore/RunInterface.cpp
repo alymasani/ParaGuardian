@@ -23,6 +23,7 @@
 #include "Tasks/HealthMonitorTask.hpp"
 #include "Tasks/SensorAcquisitionTask.hpp"
 #include "Tasks/SensorProcessingTask.hpp"
+#include "Tasks/StorageTask.hpp"
 #include "Tasks/SystemHealth.hpp"
 
 namespace {
@@ -56,7 +57,12 @@ extern "C" void paraguardian_create_tasks(void)
     SensorProcessingTask& processing = SensorProcessingTask::Inst();
     processing.InitTask(acquisition.hub());
 
-    // 3. Emergency / alert task: crash -> emergency manager -> alert dispatcher.
+    // 3a. Storage task (external flash). Created BEFORE the emergency task, which waits
+    //     (bounded) for the journal mount before restoring an incident. Low priority.
+    StorageTask& storage = StorageTask::Inst();
+    storage.InitTask();
+
+    // 3b. Emergency / alert task: crash -> emergency manager -> alert dispatcher.
     //    Consumes the processing task's safety events; runs on its own period so
     //    countdowns and retries continue even if sensor frames stop.
     EmergencyAlertTask& emergency = EmergencyAlertTask::Inst();
@@ -67,6 +73,7 @@ extern "C" void paraguardian_create_tasks(void)
     health.watchTask(acquisition.handle(), "SensorAcq");
     health.watchTask(processing.handle(), "SensorProc");
     health.watchTask(emergency.handle(), "EmergencyAlert");
+    health.watchTask(storage.handle(), "Storage");
     health.InitTask();
 }
 

@@ -4,10 +4,20 @@ enum class Stage(val label: String) {
     STORED("Stored on phone"), READY("Waiting for pilot to send SMS"),
     ATTEMPTING("Send attempt started"), PROVIDER_ACCEPTED("Provider accepted"),
     DELIVERED("Delivery reported"), FAILED("Delivery failed"),
-    UNKNOWN("Delivery unknown"), CANCELLED("Cancelled before send")
+    UNKNOWN("Delivery unknown"), CANCELLED("Cancelled before send"),
+    // Milestone 8: internet delivery through the ParaGuardian emergency server
+    SUBMISSION_PENDING("Submission pending · waiting for internet"),
+    SERVER_ACCEPTED("Emergency server accepted · sending")
 }
 
-enum class Route { SIMULATION, SMS }
+/** INTERNET: unattended delivery via the emergency server (configured + consented). */
+enum class Route { SIMULATION, SMS, INTERNET }
+
+/** Durable hand-off to RemoteDelivery (implemented by the outbox; idempotent per revision). */
+interface RemoteQueue {
+    fun handles(record: Record): Boolean
+    fun enqueue(record: Record)
+}
 
 data class Peer(val id: String, val route: Route, val verified: Boolean)
 data class Key(val device: String, val incident: Long)
@@ -61,7 +71,10 @@ class MockDelivery : EmergencyDeliveryService {
 }
 
 /** All operations run serially on one caller-owned dispatcher, including durable commits. */
-class EmergencyEngine(private val store: IncidentStore, private val mock: EmergencyDeliveryService) {
+class EmergencyEngine(
+    private val store: IncidentStore, private val mock: EmergencyDeliveryService,
+    private val remote: RemoteQueue? = null
+) {
     fun receive(peer: Peer, frame: Protocol.Frame, now: Long, phone: Position? = null): Record? {
         if (!peer.verified || peer.id.isBlank()) return null
         val request = Protocol.sos(frame) ?: return null
@@ -94,6 +107,11 @@ class EmergencyEngine(private val store: IncidentStore, private val mock: Emerge
                 ))
             } else fresh
             store.put(updated)
+            // A newer revision / cancellation of an incident already handed to the server: resubmit
+            // (the server de-duplicates on incident key + revision; cancellation notices are sent there).
+            if (previous != null && remote?.handles(updated) == true && previous.stage != Stage.STORED) {
+                remote.enqueue(updated)
+            }
         }
         val accepted = store.get(key) ?: return null
         if (accepted.revision != request.revision || accepted.cancelledNotice != (request.kind == 2)) return null
@@ -103,6 +121,12 @@ class EmergencyEngine(private val store: IncidentStore, private val mock: Emerge
     fun proceed(record: Record): Record {
         val latest = store.get(record.key) ?: return record
         if (latest.stage != Stage.STORED) return latest
+        if (remote?.handles(latest) == true) {
+            // Record first, then the outbox row: a kill in between is repaired by recover().
+            val pending = change(latest.copy(stage = Stage.SUBMISSION_PENDING))
+            remote.enqueue(pending)
+            return pending
+        }
         if (latest.route == Route.SMS) return change(latest.copy(stage = Stage.READY))
         val attempt = change(latest.copy(stage = Stage.ATTEMPTING, attempted = true))
         val result = try {
@@ -119,9 +143,22 @@ class EmergencyEngine(private val store: IncidentStore, private val mock: Emerge
             when (record.stage) {
                 Stage.STORED -> proceed(record)
                 Stage.ATTEMPTING -> change(record.copy(stage = Stage.UNKNOWN))
+                Stage.SUBMISSION_PENDING, Stage.SERVER_ACCEPTED -> remote?.enqueue(record)   // idempotent
                 else -> Unit
             }
         }
+    }
+
+    /** Applies a server-reported outcome. Never moves a record back to "pending" once it progressed. */
+    fun applyRemote(update: RemoteUpdate): Record? {
+        val record = store.get(update.key) ?: return null
+        if (update.stage == Stage.SUBMISSION_PENDING && record.stage !in setOf(Stage.STORED, Stage.SUBMISSION_PENDING))
+            return null
+        if (record.stage == update.stage) return null
+        if (record.stage == Stage.DELIVERED && update.stage != Stage.DELIVERED) return null
+        val attempted = record.attempted || update.stage in
+            setOf(Stage.SERVER_ACCEPTED, Stage.PROVIDER_ACCEPTED, Stage.DELIVERED, Stage.UNKNOWN)
+        return change(record.copy(stage = update.stage, attempted = attempted))
     }
 
     fun preparePhoneSos(now: Long, incident: Long, position: Position?): Record {

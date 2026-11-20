@@ -99,10 +99,25 @@ enum : uint32_t {
     ManuallyConfirmed     = 1u << 5,   ///< a manual SOS confirmed an automatic incident
     CountdownOverrun      = 1u << 6,   ///< the countdown was evaluated late (scheduler gap)
     Unvalidated           = 1u << 7,   ///< countdowns / retry policy are placeholders (always, today)
+    // Milestone 8 (persistence / identity)
+    PersistencePending    = 1u << 8,   ///< the latest state is queued, not yet committed to flash
+    PersistenceDegraded   = 1u << 9,   ///< a commit failed after its retries (state may be lost on reset)
+    IdentityUncertain     = 1u << 10,  ///< ids restarted from a blank-but-expected / corrupt journal
+    IdentityExhausted     = 1u << 11,  ///< 32-bit incident id space wrapped: re-provision the device
+    IdentityUnconfirmed   = 1u << 12,  ///< current request left the device before its id was durable
+    RepeatedResetEscalated= 1u << 13,  ///< resets kept restarting the countdown: request created at restore
 };
 }  // namespace emflag
 
 /// The emergency manager's state (latest-value; the dispatcher and the health task read it).
+/// Durability of the newest emergency state (EmergencyStatus::persist).
+enum class PersistState : uint8_t {
+    Disabled = 0,   ///< no store: nothing survives a reset
+    Committed,      ///< the newest state is durably committed
+    Pending,        ///< queued; a reset now loses the newest transition
+    Failed,         ///< commit attempts exhausted for the newest state (store keeps retrying)
+};
+
 struct EmergencyStatus {
     uint32_t sequence;
     uint32_t timestampMs;
@@ -149,8 +164,14 @@ struct EmergencyStatus {
     uint32_t deliveriesFailed;
     uint32_t deliveriesUnknown;
     uint32_t detectorSilenceIncidents;
-    uint32_t persistenceWrites;
-    uint32_t persistenceFailures;
+    uint32_t persistenceWrites;     ///< records COMMITTED (not merely queued)
+    uint32_t persistenceFailures;   ///< rejected saves + failed commits
+    // Milestone 8
+    PersistState persist;
+    uint32_t persistLatencyMaxMs;   ///< queue -> commit, worst seen
+    uint32_t nextIncidentId;        ///< id the next incident will use
+    uint16_t batteryMillivolts;     ///< last valid battery reading given to the manager (0 = unknown)
+    uint8_t countdownRestarts;      ///< resets during the current countdown
 };
 static_assert(std::is_trivially_copyable<EmergencyStatus>::value, "status must be memcpy-safe");
 

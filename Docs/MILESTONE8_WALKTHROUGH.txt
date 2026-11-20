@@ -1,0 +1,499 @@
+PARAGUARDIAN – MILESTONE 8 WALKTHROUGH
+Persistent emergencies, flash logging, unattended SOS delivery, power, outputs
+============================================================================
+
+Written for an engineering student who must explain and defend every design
+decision. Read it top to bottom once; afterwards use the section numbers.
+Companion documents: MILESTONE8_SOFTWARE_RELIABILITY_DESIGN.md (reference),
+MILESTONE8_VALIDATION_REPORT.md (evidence), MILESTONE8_HARDWARE_BRINGUP.md (what is left).
+
+Contents
+  Part I   Fundamentals
+    1. What flash memory is
+    2. Erase versus program
+    3. Why interrupted writes are dangerous
+    4. What a journal is
+    5. What a CRC does (and does not do)
+    6. How recovery works
+    7. Why incident ids must survive resets
+    8. Why "queued" does not mean "persisted"
+    9. How a storage task operates
+   10. Why logging must not block sensor acquisition
+   11. HTTP and TLS in five minutes
+   12. Idempotency and retries
+   13. Why provider acceptance is not delivery
+   14. Android background-process limitations
+   15. What battery state monitoring means
+   16. Why the 5 V regulator and amplifier can be software controlled
+   17. Why the LiDAR must not be switched off carelessly
+   18. How audio patterns are scheduled
+   19. Watchdogs and task heartbeats
+   20. How fault injection works
+  Part II  File by file
+  Part III Worked end-to-end examples
+  Part IV  Defending the work
+
+
+============================================================================
+PART I – FUNDAMENTALS
+============================================================================
+
+1. WHAT FLASH MEMORY IS
+-----------------------
+The W25Q128JV on the board is a 16 MiB "NOR flash" chip reached over SPI.
+It keeps its contents with the power off (non-volatile), unlike the MCU's
+RAM, which is lost at every reset. It is organised as
+   65,536 pages  of 256 bytes   (the unit you PROGRAM)
+    4,096 sectors of 4 KiB      (the smallest unit you ERASE)
+Each cell survives about 100,000 erase cycles (datasheet minimum), so
+software must spread erases ("wear levelling") and avoid needless writes.
+
+2. ERASE VERSUS PROGRAM
+-----------------------
+Erasing sets every bit of a sector to 1 (bytes read 0xFF). It is slow:
+typically 45 ms, at most 400 ms per sector.
+Programming can only change bits from 1 to 0, and is fast (about 0.4 ms
+per page, at most 3 ms). You cannot program a 0 back to 1; you must erase
+the whole sector. Consequence: you cannot "overwrite" a record in place.
+New data is APPENDED into still-erased space, and old sectors are erased
+later as a whole. Also: a program must stay inside one 256-byte page; the
+chip silently wraps to the start of the page otherwise (the M1 driver
+rejects such writes).
+
+3. WHY INTERRUPTED WRITES ARE DANGEROUS
+---------------------------------------
+Power can disappear at any moment (a crash damages the battery
+connector!). If it disappears while a page is being programmed, some bits
+of the new data reached 0 and some did not: the bytes are a random mix of
+old and new. If it disappears during an erase, the sector is partly erased.
+Software that reads such bytes later and believes them would restore a
+nonsense emergency state, or worse, think there was no emergency.
+The rule we follow: never trust a record unless it can PROVE it was
+written completely, and never destroy the last good copy before the new
+one is proven.
+
+4. WHAT A JOURNAL IS
+--------------------
+A journal (or log-structured store) never modifies old data. Each change is
+appended as a new, numbered record. The current state is simply "the
+newest complete record". Our emergency journal uses two sectors as a ring
+of 64-byte slots: when one sector is full, the OTHER sector (which holds
+only older records) is erased and writing continues there.
+Because the newest good record always lives in the sector being written,
+erasing the other sector can never lose it. That is the whole power-loss
+argument for rotation.
+
+5. WHAT A CRC DOES (AND DOES NOT DO)
+------------------------------------
+A CRC-32 is a 32-bit checksum computed over the record. If any bit changes
+by accident (torn write, worn cell, noise), the stored CRC almost certainly
+no longer matches (undetected chance about 1 in 4 billion for random
+damage). It is NOT security: anyone can compute a matching CRC for forged
+data. Authentication needs a secret key (we use HMAC-SHA256 between the
+phone and the server, see 11).
+Our slots add a second guard: a "commit word" (0x3CC3A55A) written LAST,
+after the body was read back and compared. A slot is valid only if magic,
+version, CRC AND the exact commit word are present. A cut during the body
+breaks the CRC; a cut during the commit word leaves some of its bits still
+1, so it does not equal 0x3CC3A55A.
+
+6. HOW RECOVERY WORKS
+---------------------
+At boot the storage task "mounts" the journal: it reads every slot of both
+sectors (128 x 64 bytes) and classifies each one as erased, committed,
+intact-but-uncommitted, or garbage. The committed slot with the highest
+sequence number is the current state. Writing resumes after the last used
+slot of that sector (skipping garbage). The emergency task then calls
+EmergencyManager::restore(), which continues the incident under the same id
+(table in the design document, section 6).
+Flight logs mount similarly: the sector with the highest header sequence is
+the newest; inside it, records are parsed page by page until the first
+erased byte or the first record whose CRC fails.
+
+7. WHY INCIDENT IDS MUST SURVIVE RESETS
+---------------------------------------
+The phone and the server recognise "the same emergency" by
+(device id, incident id). That is what makes retries safe: the third copy
+of incident 7 does not text your mother three times. If the MCU forgot its
+counter at reset and started again at 1, a NEW crash could arrive as
+"incident 1" and be thrown away as a duplicate of an old, finished
+incident 1. That would silently swallow a real SOS.
+Our rule: before an incident's request leaves the device for the first
+time, the record saying "the next id is N+1" must be COMMITTED. Then no
+later boot can reuse N. The wait is bounded (2 s): if the flash is broken,
+the SOS goes out anyway with a flag "this id may repeat" so the phone and
+server key it differently. Help is never delayed indefinitely for
+bookkeeping.
+
+8. WHY "QUEUED" DOES NOT MEAN "PERSISTED"
+-----------------------------------------
+The emergency task must never wait for flash (an erase can take 400 ms, and
+an SOS countdown must keep ticking). So saving is split: save() copies 32
+bytes into RAM and returns "Queued" plus a ticket number. The storage task
+later writes it and announces "ticket 17 committed". Until then a power cut
+loses it. The status therefore reports Pending, not Saved. Reporting a
+queued write as saved would be a lie exactly when it matters (power loss).
+
+9. HOW A STORAGE TASK OPERATES
+------------------------------
+StorageTask is a FreeRTOS task with LOW priority (20) that alone owns the
+flash. It sleeps until notified (an emergency record was queued) or 50 ms
+pass. Each step does ONE bounded piece of work in strict priority order:
+emergency commit, critical log, telemetry log, maintenance. The emergency
+record is checked before every step, so at most one step (worst case one
+sector erase) delays it, no matter how much telemetry is waiting.
+
+10. WHY LOGGING MUST NOT BLOCK SENSOR ACQUISITION
+-------------------------------------------------
+Acquisition reads the IMUs every 10 ms at priority 40. If it waited for a
+400 ms erase, 40 samples would be lost and the crash detector and the UKF
+would see a hole. So producers only copy a record (up to 48 bytes) into a
+bounded queue and return; if the queue is full the record is dropped and
+COUNTED. Telemetry and critical records use separate queues so a telemetry
+burst cannot push out an emergency record.
+
+11. HTTP AND TLS IN FIVE MINUTES
+--------------------------------
+HTTP is a request/response protocol: the phone sends "POST /v1/incidents"
+with a JSON body; the server answers a status code (200 OK, 202 Accepted,
+401 Unauthorized, 429 Too Many Requests, 503 Unavailable...) and a body.
+TLS (the "S" in HTTPS) encrypts the connection and proves the server's
+identity with a certificate signed by an authority the phone trusts, so
+nobody on the network can read the location or impersonate the server.
+TLS does not tell the SERVER who the phone is. For that every request is
+signed: HMAC-SHA256(device secret, method + path + time + nonce +
+SHA-256(body)). The server recomputes it; a wrong secret, an edited body,
+a 5-minute-old timestamp or a nonce seen before are all rejected (replay
+protection).
+
+12. IDEMPOTENCY AND RETRIES
+---------------------------
+An operation is idempotent if doing it twice has the same effect as doing
+it once. Networks lose answers: the phone sends the SOS, the server stores
+it, the reply is lost, the phone retries. Without idempotency the contacts
+get two texts; worse, retries during a long outage could spam them.
+Server rules: an incident is keyed by (device, incident key); a repeated
+revision changes nothing; each outbound message is a row that can exist
+ONCE per (incident, contact, purpose). Retrying is therefore always safe
+for the phone. On the provider side we cannot know whether a timed-out
+request was sent, so such messages become "unknown" instead of being
+re-sent automatically (at-most-once); a person can decide to resend.
+
+13. WHY PROVIDER ACCEPTANCE IS NOT DELIVERY
+-------------------------------------------
+"HTTP 201 from Twilio" means: Twilio accepted the message into its queue.
+It may still fail (unreachable phone, carrier filtering). "Delivered" comes
+later through a status callback, and even that is the CARRIER saying the
+handset received it, not that a human read it. The app and the device
+therefore show separate stages: submission pending, server accepted,
+provider accepted, delivered, failed, unknown.
+
+14. ANDROID BACKGROUND-PROCESS LIMITATIONS
+------------------------------------------
+Android kills app processes to save memory and battery. Long work must run
+in a FOREGROUND SERVICE with a visible notification (ours: type
+"connectedDevice"). Since Android 12 an app may only START such a service
+from the background in specific situations (e.g. after BOOT_COMPLETED for
+this type, or when a companion device appears). After the user presses
+"Force stop", Android delivers nothing to the app until the user opens it
+again; no app can bypass that, and we do not claim to. We therefore keep
+two separate facts: what the user REQUESTED (stored) and what is actually
+RUNNING; the screen shows "interrupted, tap Resume" when they differ.
+
+15. WHAT BATTERY STATE MONITORING MEANS
+---------------------------------------
+We can (once wired) measure the battery VOLTAGE through a divider and ADC,
+and read the charger's "charging" and "done" pins. Voltage depends on
+load, temperature and age; it supports "low" and "critical" warnings with
+thresholds from the battery's own characterisation, NOT a precise
+percentage. A percentage is only reported from a real fuel-gauge chip. We
+add hysteresis (a level must recover 50 mV above its threshold) and require
+3 consecutive samples, so a motor current spike does not flicker the
+warning. Missing data is "Unknown", never "Healthy".
+
+16. WHY THE 5 V REGULATOR AND AMPLIFIER CAN BE SOFTWARE CONTROLLED
+------------------------------------------------------------------
+Regulators and the MAX98357A have an enable pin: a GPIO can switch them.
+Turning the amplifier off when silent saves current and avoids hiss; turning
+the 5 V rail off saves the LiDAR's power. But switching costs time: a rail
+needs milliseconds to settle and a device after it may need warm-up. So
+PowerRail adds: a safe default at boot, a settle time before "ready", an
+off-delay so it does not toggle between beeps, and fault detection from a
+power-good signal if one exists.
+
+17. WHY THE LIDAR MUST NOT BE SWITCHED OFF CARELESSLY
+-----------------------------------------------------
+The LiDAR measures distance to the ground. It feeds: flight-phase detection
+(approach), landing warnings (low clearance, rapid closure), crash context
+(was the ground close?) and missing-data alerts. If it is off, those
+features silently degrade, and after power-up it needs warm-up time to be
+trusted again. Default policy: keep it on. Only on Critical battery, on the
+ground, with no open emergency, and only if explicitly configured, may it
+be shed.
+
+18. HOW AUDIO PATTERNS ARE SCHEDULED
+------------------------------------
+Three layers: the dispatcher picks ONE alert for the speaker by priority
+(SOS countdown 100 ... advisory 20); the AudioAlertScheduler turns its
+pattern ("3 beeps every 3 s") into timed tone requests; PcmToneOutput
+turns each tone into 16-bit samples (square wave, 2 ms fade in/out against
+clicks) for the I2S amplifier, filled from the DMA interrupt. A higher
+priority alert pre-empts the current one (after a short fade); a tone is
+only counted as audible if the amplifier was powered and ready.
+
+19. WATCHDOGS AND TASK HEARTBEATS
+---------------------------------
+A hardware watchdog resets the MCU unless software "feeds" it regularly. It
+recovers from a hang, but a blind feeder in a timer would keep feeding even
+if the SOS task were stuck. So the health task feeds it only if every
+critical task made PROGRESS (its counter moved) recently: that is a
+heartbeat. A reset loses RAM, so while an incident's newest state is not
+yet on flash we defer the reset up to 5 s for the storage task to commit
+it. (The hardware watchdog is not enabled yet: bring-up section 11.)
+
+20. HOW FAULT INJECTION WORKS
+----------------------------
+Instead of waiting for faults, tests cause them on purpose in simulated
+parts. FakeNorFlash can lose power after exactly N programmed bytes, during
+an erase, time out, fail reads, flip a bit, or vanish entirely. Because the
+"reset" in the tests destroys every RAM object and keeps only the fake
+flash bytes, each test is a faithful reboot. The journal test cuts power at
+every one of the 65 byte positions of a commit; the persistence tests reset
+during countdown, transmission, acceptance, delivery and cancellation.
+
+
+============================================================================
+PART II – FILE BY FILE
+============================================================================
+
+Components/Storage/NorFlash.hpp
+  Purpose   flash abstraction + partition plan.
+  In / out  addresses and bytes / Status.
+  Key       INorFlash, W25qNorFlash (adapter to the M1 driver),
+            UnconfiguredNorFlash (firmware default), partition:: constants
+            with static_assert that regions touch exactly and end at 16 MiB.
+  Decision  the journal and logs never see SPI; tests swap in FakeNorFlash.
+  Tests     every storage test.  Limit: no real chip wired yet.
+
+Components/Storage/EmergencyJournal.hpp/.cpp
+  Purpose   power-loss-safe store of the 32-byte emergency record.
+  Key       mount(), commit(), maintain(), latest(), uncommitted(),
+            encodeSlot()/classifySlot().
+  Decisions commit word written last + read-back verify; two-sector ring;
+            burned slots never reused; sequence above every intact slot;
+            refuse at sequence exhaustion instead of wrapping.
+  Alternatives  (a) one fixed record rewritten in place: impossible on NOR
+            without erasing the only copy. (b) A/B two-record ping-pong:
+            erases a sector per write (wear 64x higher).
+  Tests     test_storage_journal.cpp (9 journal tests).
+  Limit     power-cut behaviour of real silicon not measured.
+
+Components/Storage/JournaledEmergencyStore.hpp
+  Purpose   asynchronous IEmergencyStore with tickets.
+  Key       save() (emergency task), takePending()/reportCommitted()/
+            reportFailed()/publishMount() (storage task).
+  Decision  coalesce to the newest record; critical sections copy <= 32 B.
+  Tests     storage service + persistence tests.
+
+Components/Algorithms/Emergency/IEmergencyStore.hpp  (changed)
+  Record v2 adds countdownRestarts and identityFlags (v1 still decodes).
+  PersistAck {Rejected, Queued, Committed}, StoreMount {Unavailable, Blank,
+  Recovered, Corrupt}, loadUncommitted(), committedTicket(), failedTicket().
+
+Components/Algorithms/Emergency/EmergencyManager.*  (changed)
+  New: durability tracking (pollPersistence), identity hold before first
+  transmission, identity floor from committed + uncommitted records,
+  sticky Uncertain / Exhausted flags, countdown reboot-loop guard,
+  observeBattery() -> Battery field of the SOS request.
+  Tests     test_emergency_persistence.cpp (12) + all M6/M7 tests unchanged.
+
+Components/Storage/LogRecords.*, FlightLog.*, FlightRecorder.*
+  Purpose   versioned binary records, rotating log ring, logging policy.
+  Decisions explicit field-by-field encoding (no padding), records never
+            cross pages, incremental page programming, separate critical
+            partition, rate-limited profiles, no raw samples.
+  Tests     log tests + recorder round trip + golden vector.
+  Decoder   Tools/pglog/pglog_decode.py (+ test_pglog_decode.py).
+
+Components/Storage/StorageService.*, Components/Tasks/StorageTask.*
+  Purpose   priority scheduling of flash work; the RTOS task around it.
+  Decision  one unit per step, emergency first; priority 20; static stack.
+  Tests     storage_service_* tests; CubeIDE builds.
+
+Components/Power/PowerManager.*
+  Purpose   battery / charge / supply interpretation, rail + amplifier policy.
+  Decisions unconfigured thresholds = Unknown; confirmation + hysteresis;
+            amplifier only on a ready rail; LiDAR kept by default; emergency
+            never sheds outputs.
+  Tests     5 power tests.  Limit: no adapter (pins unknown).
+
+Components/Output/Audio/PcmToneOutput.*, Components/Output/LED/GpioStatusLed.*
+  Purpose   real PCM tone generation; GPIO LED driver for the pattern table.
+  Tests     frequency / duration / ramp / volume, amplifier gating, pre-emption;
+            LED timing equality over 4 s. The LED test found a real bug.
+
+Components/Sensors/LSM6DSRX/Lsm6dsrxFifo.*
+  Purpose   FIFO decode + bounded drain + peak extraction (not enabled).
+  Tests     peak captured that polling misses; overflow, saturation, bound,
+            partial read, unknown tag.
+
+Components/Common/TaskSupervisor.*
+  Purpose   heartbeat supervision + emergency-safe reset policy.
+  Tests     stall detection, storage degrade, deferral then reset.
+
+Components/Algorithms/Safety/* (changed)
+  New alert kinds LowBattery, SystemFault, PhoneDisconnected appended (M6
+  priorities untouched), setSystemInputs().
+
+Backend/paraguardian_sos/  (new, Python standard library)
+  config.py     environment-only configuration; live delivery needs an
+                explicit switch AND credentials.
+  store.py      SQLite schema, transactions.
+  auth.py       HMAC request signing, replay protection.
+  providers.py  FakeProvider, DisabledProvider, TwilioProvider, webhook
+                signature.
+  service.py    validation, idempotent incidents/jobs, cancellation,
+                worker with leases, callbacks, diagnostics, purge.
+  server.py     HTTP(S) routes, size limits, TLS rule, worker thread.
+  __main__.py   serve / provision-device / purge / diagnostics.
+  Alternatives  Flask/FastAPI (extra dependencies), a cloud function
+                (deployment we must not perform). The standard library
+                keeps it runnable anywhere, including in CI.
+  Tests     Backend/tests/test_backend.py (18).
+
+Android: RemoteDelivery.kt (signer, transport, outbox engine), Lifecycle.kt
+  (MonitorStatus, MonitoringStarter, BootReceiver, PresenceService,
+  DeliveryJobService, BackendCredentials), Emergency.kt (stages, INTERNET
+  route, RemoteQueue, applyRemote), Storage.kt (DB v2 outbox, settings),
+  GuardianApplication.kt (wiring, worker), MonitoringService.kt (sticky
+  restart), MainActivity.kt (status + delivery settings), manifest,
+  network security configs, backup rules.
+  Tests     DeliveryTest.kt (9 JVM incl. real-backend E2E),
+            M8LifecycleTest.kt (3 emulator).
+
+
+============================================================================
+PART III – WORKED EXAMPLES
+============================================================================
+
+EXAMPLE 1: crash -> countdown -> SOS -> persist -> reset -> recover -> BLE
+           -> Android -> backend -> mock provider -> reconciliation
+ t=0.0 s   CrashDetector reports CrashSuspected (episode 3).
+           EmergencyManager::observeCrash -> openIncident: id = nextIncidentId
+           = 4, next becomes 5; state Countdown(60 s); persist() -> store
+           returns Queued, ticket 12. EmergencyAlertTask notices hasPending()
+           and notifies StorageTask.
+ t=0.002   StorageTask: commitEmergency -> journal slot 9 of sector A:
+           body programmed, read back, commit word programmed, read back.
+           reportCommitted(12). Next tick the manager sees committed >= 12:
+           persist = Committed, committedNextId = 5 (id 4 is now durable).
+ t=60.0    Countdown expires: createRequest (revision 1), persisted (ticket
+           13). serviceTransport: identityDurable(4) is true -> submit to BLE.
+ t=60.5    The battery connector bounces: power lost. RAM gone.
+ boot      StorageTask mounts: newest committed slot says AwaitingPhoneAck,
+           incident 4, revision 1, next id 5. EmergencyAlertTask waits for
+           mounted(), restore(): same incident 4, revision 2, Restored flag,
+           SosPending; boot record committed.
+ +0.1 s    BLE sends SOS #4 rev 2 to the phone.
+ phone     EmergencyEngine.receive: Key(device, 4) new -> stored; route
+           INTERNET -> proceed(): stage SUBMISSION_PENDING, outbox row written
+           (incidentKey "4", revision 2) BEFORE any network call.
+           Worker: POST /v1/incidents, signed. Server: new incident, one job
+           per consented contact, 202 {"overall":"pending"}. App:
+           SERVER_ACCEPTED; reports PHONE_ACCEPTED + SEND_ATTEMPTED to MCU.
+ server    Worker claims job (lease 60 s) -> FakeProvider accepted ->
+           provider_accepted. (Real provider: same, through TwilioProvider.)
+ +15 s     App polls GET /v1/incidents/4: provider_accepted -> stage
+           PROVIDER_ACCEPTED (NOT delivered).
+ later     Provider callback "delivered" (signature verified, de-duplicated)
+           -> job delivered -> next poll: DELIVERED -> app reports
+           DELIVERY_CONFIRMED -> MCU state Delivered, persisted.
+ If the phone had retried the POST after a lost answer: "duplicate", no
+ second job. If the MCU had re-sent revision 1: ignored as older.
+
+EXAMPLE 2: normal flight -> sensor data -> logging -> flash corruption -> recovery
+ Processing task every frame: FlightRecorder.logNavigation (Normal profile:
+ once a second -> 37-byte record into the telemetry queue), logQuality
+ (every 5 s), logCrash (only on state change). Emergency task logs every
+ safety event (flight phase changes into the CRITICAL queue).
+ StorageTask appends records into the page buffer of flight-log sector 812
+ and programs the new bytes when the page fills or after 1 s.
+ Power fails while page 7 of sector 812 is being programmed: the last
+ record is torn. At boot: sector 812 has the highest header sequence; pages
+ 0-6 parse completely; page 7 ends at a record whose CRC fails -> the rest
+ of page 7 is abandoned (tornAtMount 1), writing resumes on page 8 with the
+ next sequence. On the ground: dump 0x020000.., run
+   python3 Tools/pglog/pglog_decode.py flight.bin --region > flight.csv
+ You get every complete record in order; the torn one is counted, not
+ guessed. Had the flash chip died entirely, both logs and the journal mount
+ Unavailable, every save is Rejected, the SOS path is unaffected and
+ g_systemHealth shows the mounts as 1 (Unavailable).
+
+EXAMPLE 3: low battery -> power policy -> amplifier -> critical alert
+ Battery adapter (future) reports 3480 mV three times (thresholds configured
+ for the real battery, say low 3500 / critical 3300): level Low. The
+ emergency task (1 Hz) passes it to the dispatcher: LowBattery alert,
+ Caution, priority 45 -> CautionDouble pattern. AudioAlertScheduler requests
+ a beep; PcmToneOutput wantsAmplifier() -> audioRequested -> PowerManager
+ turns on the 5 V rail (already on for the LiDAR), waits settleMs, enables
+ the amplifier, waits its settle time -> audioReady -> setAmplifierReady(true)
+ -> the DMA callback renders the 1100 Hz tone. 1.5 s after the last beep
+ the amplifier is switched off again (hold time), the rail stays on (LiDAR).
+ Later 3290 mV x3 -> Critical -> LowBattery escalates to Warning (priority
+ 70) and quiet alerts are restricted. A crash now opens an SOS countdown:
+ priority 100 pre-empts everything, the emergency keeps the rail and the
+ amplifier allowed, and the SOS request carries the battery millivolts so
+ rescuers know the device may die soon.
+
+
+============================================================================
+PART IV – DEFENDING THE WORK
+============================================================================
+Questions you should expect, and the honest answers:
+
+Q: "How do you KNOW the journal survives power loss?"
+A: By construction (append-only, commit word last, newest copy never erased)
+   and by test: power cut at every byte of a commit (65 positions), during
+   erase, bit flips, total corruption. The limit: the fault model is ours;
+   real silicon may fail in other ways (e.g. a partially programmed cell
+   that reads differently later). The bring-up plan includes 1,000 real
+   power cuts.
+
+Q: "Why not save the state every 20 ms?"
+A: Wear (100k cycles) and SPI time. State changes are events; we persist on
+   every transition, which is what recovery needs.
+
+Q: "What if the flash is broken during an emergency?"
+A: The SOS is not delayed beyond 2 s; it is sent marked "id may repeat",
+   and the status says persistence is degraded. Durability is reported, not
+   assumed.
+
+Q: "Can the server send the same SMS twice?"
+A: Not by itself: jobs are unique, retries are idempotent, uncertain sends
+   become "unknown". A duplicate can only happen if a person presses
+   "retry unknown" for a message that had in fact gone out. Exactly-once is
+   impossible over SMS; we chose at-most-once plus transparency.
+
+Q: "Is HMAC with a stored secret secure?"
+A: It authenticates devices and stops replays, over TLS. Its weakness: the
+   server must store the secret (production: a secrets manager). It is a
+   per-device credential, never a shared app secret, never in the APK.
+
+Q: "Does monitoring survive everything on Android?"
+A: No, and we do not claim it. Process death: sticky restart. Reboot: boot
+   receiver. Device back in range: companion presence. Force stop: only the
+   user can restart it; the app shows that clearly. None of the restart
+   paths has been observed on a physical phone yet.
+
+Q: "Why is the FIFO not enabled if it is better?"
+A: Because its register map must be confirmed on the real part and the
+   benefit measured with a drop rig. The decoding and draining are tested;
+   switching acquisition to it without measurement would be a claim we
+   cannot support.
+
+Q: "What did testing find?"
+A: Two real defects: (1) after the incident-id counter wraps, the identity
+   hold could never end (fixed: no hold when ids are exhausted); (2) the
+   GPIO LED backend never wrote the first "on" phase of a pattern (fixed).
+   Several of our own wrong test expectations were also corrected, each
+   explained in the validation report rather than silently changed.

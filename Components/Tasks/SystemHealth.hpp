@@ -196,6 +196,38 @@ struct SystemHealthSnapshot {
     uint32_t emergencyMaxWorkMs;
     uint32_t emergencyMaxWakeIntervalMs;
     uint32_t emergencyLateWakes;
+    // Storage (StorageTask / StorageService), Milestone 8. Flash is UNCONFIGURED in firmware today.
+    uint8_t journalMount;              ///< pg::JournalMount (2 Blank, 3 Recovered, 4 Corrupt, 1 Unavailable)
+    uint8_t criticalLogMount;          ///< pg::LogMount
+    uint8_t flightLogMount;            ///< pg::LogMount
+    uint8_t emergencyPersist;          ///< pg::PersistState of the newest emergency state
+    uint32_t journalSequence;
+    uint32_t bootCount;                ///< from the journal (0 = unknown / no flash)
+    uint32_t emergencyCommits;
+    uint32_t emergencyCommitFailures;
+    uint32_t emergencyPersistLatencyMaxMs;
+    uint32_t criticalLogRecords;
+    uint32_t telemetryLogRecords;
+    uint32_t logFailures;
+    uint32_t logRecordsLost;
+    uint32_t logQueueDropsCritical;
+    uint32_t logQueueDropsTelemetry;
+    uint32_t storageMaxUnitMs;
+    uint32_t nextIncidentId;
+    // Power (PowerManager). Battery thresholds / switches UNCONFIGURED: level 0 = Unknown.
+    uint8_t batteryLevel;              ///< pg::BatteryLevel
+    uint8_t chargeState;               ///< pg::ChargeState
+    uint8_t supplyState;               ///< pg::SupplyState
+    uint8_t rail5vState;               ///< pg::RailState (0 = Unconfigured)
+    uint8_t amplifierState;            ///< pg::RailState
+    uint8_t powerFlags;                ///< pg::powerflag::*
+    uint16_t batteryMillivolts;        ///< 0 = unknown
+    // Task supervision (TaskSupervisor policy; hardware watchdog NOT enabled)
+    uint8_t supervisorAction;          ///< pg::SupervisorAction
+    uint8_t supervisorStalledMask;     ///< bit i = supervised task i stalled
+    uint8_t supervisorLateMask;
+    bool supervisorResetDeferred;      ///< reset withheld while the emergency state was not durable
+    uint32_t supervisorStallEvents;
     // Start-up problems (task creation / registration)
     uint32_t startupErrors;
     /// RCC->RSR captured at boot (bit 24 SFTRSTF software reset, 26 IWDG1RSTF,

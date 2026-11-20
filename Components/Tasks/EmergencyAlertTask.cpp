@@ -12,10 +12,13 @@
 #include "BSP/RtosClock.hpp"
 #include "Processing/TimeBase.hpp"
 #include "Tasks/SensorProcessingTask.hpp"
+#include "Tasks/StorageTask.hpp"
+#include "Tasks/SystemHealth.hpp"
 
 EmergencyAlertTask::EmergencyAlertTask()
     : Task(0u),   // no SoarOS command queue: commands arrive through commands_
-      manager_(pg::EmergencyConfig{}, transport_, &store_),
+      power_(pg::BatteryConfig{}, pg::PowerPolicyConfig{}, &rail5vSwitch_, &amplifierSwitch_),
+      manager_(pg::EmergencyConfig{}, transport_, &StorageTask::Inst().store()),
       dispatcher_(pg::DispatcherConfig{}, &audioBackend_, &ledBackend_),
       commands_(commandLock_),
       reports_(reportLock_),
@@ -23,7 +26,8 @@ EmergencyAlertTask::EmergencyAlertTask()
       emergencyOut_(emergencyLock_),
       bleOut_(emergencyLock_),
       sosOut_(sosLock_),
-      dispatchOut_(dispatchLock_)
+      dispatchOut_(dispatchLock_),
+      powerOut_(dispatchLock_)
 {
     manager_.addSink(&localEvents_);   // before the scheduler starts: no locking needed
 }
@@ -61,7 +65,24 @@ void EmergencyAlertTask::Run(void* /*pvParams*/)
 {
     pg::IClock& clock = pg::bsp::systemClock();
     SensorProcessingTask& proc = SensorProcessingTask::Inst();
-    manager_.restore(clock.millis());   // NullEmergencyStore: nothing to restore (reported in the status)
+    StorageTask& storage = StorageTask::Inst();
+    pg::FlightRecorder& recorder = storage.recorder();
+    // Wait (bounded) for the storage task to mount the journal, then restore the incident.
+    // Unconfigured / failed flash mounts as Unavailable: restore() then reports no persistence.
+    const uint32_t waitStart = clock.millis();
+    while (!storage.store().mounted() &&
+           pg::timebase::ageMs(waitStart, clock.millis()) < TaskConfig::STORAGE_MOUNT_WAIT_MS) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    manager_.restore(clock.millis());
+    storage.notify();
+    {
+        pg::StorageStatus ss{};
+        storage.status().read(ss);
+        recorder.logBoot(pg::g_systemHealth.resetFlags, ss.bootCount, ss.journalMount, ss.criticalMount,
+                         ss.flightMount, clock.millis());
+    }
+    power_.start(clock.millis());
 
     const TickType_t period = pdMS_TO_TICKS(TaskConfig::EMERGENCY_PERIOD_MS);
     uint32_t lastWake = clock.millis();
@@ -92,22 +113,52 @@ void EmergencyAlertTask::Run(void* /*pvParams*/)
         if (haveCrash) manager_.observeCrash(crashCopy_, now);
         // 4. Time-driven transitions: countdown, retries, timeouts (independent of sensor frames).
         manager_.tick(now);
+        if (storage.store().hasPending()) storage.notify();   // the journal commit runs in StorageTask
+        recorder.logEmergency(manager_.status(), now);
 
         // 5. Events (bounded drain): processing-task events, then this task's own.
         pg::SafetyEvent e{};
         uint32_t nEvents = 0u;
         while (nEvents < TaskConfig::EMERGENCY_MAX_EVENTS_PER_WAKE && proc.safetyEvents().pop(e)) {
             dispatcher_.consume(e, now);
+            recorder.logEvent(e, now);
             ++nEvents;
         }
         for (size_t i = 0; i < TaskConfig::EMERGENCY_EVENT_DEPTH && localEvents_.pop(e); ++i) {
             dispatcher_.consume(e, now);
+            recorder.logEvent(e, now);
             ++nEvents;
         }
         if (nEvents > stats_.maxEventsPerWake) stats_.maxEventsPerWake = nEvents;
 
         // 6. Alerts: state from the latest snapshot / crash / emergency status, then outputs.
         const bool haveSafety = proc.safety().read(safetyCopy_);
+        const pg::EmergencyState es = manager_.status().state;
+        const bool emergencyOpen = es != pg::EmergencyState::Idle && es != pg::EmergencyState::Unavailable;
+        const bool inFlight = haveSafety && pg::isAirbornePhase(safetyCopy_.phase);
+        if (pg::timebase::ageMs(lastPowerMs_, now) >= 1000u) {   // power policy at 1 Hz
+            lastPowerMs_ = now;
+            pg::PowerInputs pin{};   // no battery ADC / charger pins configured: every input Unknown
+            pin.sampleMs = now;
+            const pg::PowerContext pctx{inFlight, emergencyOpen,
+                                        dispatcher_.status().audioState == pg::OutputState::Active};
+            const pg::PowerSnapshot& ps = power_.update(pin, pctx, now);
+            manager_.observeBattery(ps.millivolts, ps.level != pg::BatteryLevel::Unknown, now);
+            powerOut_.publish(ps);
+            recorder.logPower(pg::PowerLogSummary{static_cast<uint8_t>(ps.level), ps.millivolts, ps.flags,
+                                                  static_cast<uint8_t>(ps.rail5v), static_cast<uint8_t>(ps.amplifier),
+                                                  static_cast<uint8_t>(ps.lidarPowerRequested ? 1u : 0u),
+                                                  static_cast<uint8_t>(ps.supply)},
+                              now);
+            pg::SystemAlertInputs sys{};
+            sys.batteryLevel = static_cast<uint8_t>(ps.level);
+            sys.phoneLinkKnown = true;
+            sys.phoneLinkUp = transport_.linkUp();
+            sys.inFlight = inFlight;
+            sys.storageDegraded = manager_.status().persist == pg::PersistState::Failed;
+            sys.supervisorFault = pg::g_systemHealth.supervisorStalledMask != 0u;
+            dispatcher_.setSystemInputs(sys, now);
+        }
         const pg::DispatcherInputs in{haveSafety ? &safetyCopy_ : nullptr, haveCrash ? &crashCopy_.status : nullptr,
                                       &manager_.status()};
         dispatchOut_.publish(dispatcher_.update(now, in));

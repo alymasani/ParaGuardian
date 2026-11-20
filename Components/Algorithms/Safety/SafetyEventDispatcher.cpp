@@ -112,6 +112,14 @@ void SafetyEventDispatcher::acknowledge(uint32_t /*nowMs*/)
     }
 }
 
+void SafetyEventDispatcher::setSystemInputs(const SystemAlertInputs& in, uint32_t nowMs)
+{
+    if (in.phoneLinkUp) linkEverUp_ = true;
+    if (!haveSys_ || in.phoneLinkUp != sys_.phoneLinkUp) linkDownSinceMs_ = nowMs;
+    sys_ = in;
+    haveSys_ = true;
+}
+
 const DispatchStatus& SafetyEventDispatcher::update(uint32_t nowMs, const DispatcherInputs& in)
 {
     if (st_.sequence != UINT32_MAX) ++st_.sequence;
@@ -185,6 +193,19 @@ const DispatchStatus& SafetyEventDispatcher::update(uint32_t nowMs, const Dispat
     set(AlertKind::CrashSuspected, crashFresh && !incidentOpen, SafetySeverity::Critical,
         crashFresh ? in.crash->episodeId : 0u, nowMs);
     st_.crashStale = in.crash == nullptr;
+
+    // ---- system alerts (Milestone 8): battery, storage / supervisor faults, phone link ----
+    if (haveSys_) {
+        const SafetySeverity batt = sys_.batteryLevel == 3u   ? SafetySeverity::Warning
+                                    : sys_.batteryLevel == 2u ? SafetySeverity::Caution
+                                                              : SafetySeverity::Info;
+        set(AlertKind::LowBattery, batt != SafetySeverity::Info, batt, sys_.batteryLevel, nowMs);
+        set(AlertKind::SystemFault, sys_.storageDegraded || sys_.supervisorFault, SafetySeverity::Advisory,
+            (sys_.storageDegraded ? 1u : 0u) | (sys_.supervisorFault ? 2u : 0u), nowMs);
+        const bool lost = sys_.phoneLinkKnown && linkEverUp_ && !sys_.phoneLinkUp && sys_.inFlight &&
+                          elapsed(nowMs, linkDownSinceMs_) >= cfg_.phoneLossMs && !incidentOpen;
+        set(AlertKind::PhoneDisconnected, lost, SafetySeverity::Advisory, linkDownSinceMs_, nowMs);
+    }
 
     // ---- selection: highest priority; ties -> most recent ----
     AlertKind audioK = AlertKind::None, ledK = AlertKind::None;

@@ -44,12 +44,22 @@ struct EmergencyConfig {
     uint32_t detectorSilenceMs = 5000u;
     bool escalateOnDetectorSilence = true;
 
+    // ---- persistence / identity (Milestone 8) ----
+    /// The first transmission of a request waits at most this long for the record holding its
+    /// incident id to be COMMITTED (so a reset cannot hand the same id to a different incident).
+    /// After it, the request is sent anyway, marked IncidentIdVolatile: help is never withheld
+    /// because flash is slow or broken.
+    uint32_t identityHoldMs = 2000u;
+    /// Resets that may restart the SAME countdown. On the next one, restore() creates the SOS
+    /// request immediately (a brown-out loop must not postpone help forever).
+    uint8_t maxCountdownRestarts = 2u;
+
     bool isValid() const
     {
         return autoCountdownMs <= 600000u && manualCountdownMs <= autoCountdownMs && ackTimeoutMs > 0u &&
                retryBaseMs > 0u && retryMaxMs >= retryBaseMs && maxAttempts > 0u && maxCycles > 0u &&
                busyRetryMs > 0u && linkPollMs > 0u && deliveryTimeoutMs > ackTimeoutMs && detectorSilenceMs > 0u &&
-               autoCountdownMs < 0x7FFFFFFFu && deliveryTimeoutMs < 0x7FFFFFFFu;
+               autoCountdownMs < 0x7FFFFFFFu && deliveryTimeoutMs < 0x7FFFFFFFu && identityHoldMs <= 10000u;
     }
 };
 

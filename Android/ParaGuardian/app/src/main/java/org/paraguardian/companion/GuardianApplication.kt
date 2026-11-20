@@ -32,8 +32,24 @@ data class ViewState(
     val timeline: Map<Key, List<IncidentDatabase.Timeline>> = emptyMap(),
     val events: List<String> = emptyList(), val message: String = "",
     val address: String? = null, val contacts: List<Contact> = emptyList(), val template: String = "",
-    val safetyNotifications: Boolean = true, val storageReady: Boolean = false
-)
+    val safetyNotifications: Boolean = true, val storageReady: Boolean = false,
+    // Milestone 8
+    val monitoringRequested: Boolean = false, val recoveryPending: Boolean = false,
+    val presenceObserved: Boolean = false,
+    val internetDelivery: Boolean = false, val backendConfigured: Boolean = false,
+    val simulationUsesBackend: Boolean = false, val networkProblem: String? = null
+) {
+    fun monitorStatus(permissionOk: Boolean) =
+        monitorStatus(monitoringRequested, monitoring, link, permissionOk, recoveryPending, presenceObserved)
+
+    /** One honest line about the unattended delivery path. */
+    val deliveryLabel: String get() = when {
+        !internetDelivery -> if (simulation) "Delivery · in-app mock provider" else "Delivery · user-confirmed SMS (no server configured)"
+        !backendConfigured -> "No delivery provider configured"
+        networkProblem != null -> networkProblem
+        else -> "Emergency server configured"
+    }
+}
 
 class Guardian(private val context: Context) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -43,7 +59,21 @@ class Guardian(private val context: Context) {
     private val mutable = MutableStateFlow(ViewState())
     val state = mutable.asStateFlow()
     private val mock = MockDelivery()
-    private val engine = EmergencyEngine(database, mock)
+    private val credentials = BackendCredentials(context)
+    private val remote = RemoteDelivery({ if (settings.internetDelivery) credentials.load() else null },
+        UrlConnectionTransport(), database)
+    private val remoteQueue = object : RemoteQueue {
+        override fun handles(record: Record) = record.route == Route.INTERNET ||
+            (record.route == Route.SIMULATION && settings.simulationUsesBackend && settings.internetDelivery)
+        override fun enqueue(record: Record) {
+            // Simulation incidents are ALWAYS submitted as test incidents (never reach a live provider).
+            remote.enqueue(record, record.route == Route.SIMULATION, System.currentTimeMillis())
+            DeliveryJobService.schedule(context, 0L)
+            deliveryKick.trySend(Unit)
+        }
+    }
+    private val deliveryKick = Channel<Unit>(Channel.CONFLATED)
+    private val engine = EmergencyEngine(database, mock, remoteQueue)
     private val notifications = GuardianNotifications(context)
     private var incoming = Protocol.Reassembly()
     private var tx = 0L
@@ -70,13 +100,25 @@ class Guardian(private val context: Context) {
                     ViewState(settings.simulation, address = settings.address, contacts = settings.contacts(),
                         records = database.visible(), timeline = database.timeline(), template = settings.template,
                         safetyNotifications = settings.safetyNotifications, storageReady = true,
-                        lastConnected = settings.lastPhysicalConnection.takeIf { !settings.simulation && it != 0L })
+                        lastConnected = settings.lastPhysicalConnection.takeIf { !settings.simulation && it != 0L },
+                        monitoringRequested = settings.monitoringRequested, recoveryPending = settings.recoveryPending,
+                        internetDelivery = settings.internetDelivery, backendConfigured = credentials.load() != null,
+                        simulationUsesBackend = settings.simulationUsesBackend)
                 }
                 mutable.value = initial
             }
             for (packet in packets) {
                 if (paused || packet.generation != generation) continue
                 guarded("Incoming SOS could not be stored or recovered") { handle(packet) }
+            }
+        }
+        scope.launch {   // delivery worker: outbox -> server, status polling, reconciliation
+            while (true) {
+                var next: Long? = 15_000L
+                guarded("Emergency delivery worker failed") { next = runDeliveryNow() }
+                kotlinx.coroutines.withTimeoutOrNull((next ?: 15_000L).coerceIn(1_000L, 15_000L)) {
+                    deliveryKick.receive()
+                }
             }
         }
         scope.launch {
@@ -100,9 +142,12 @@ class Guardian(private val context: Context) {
         if (!packets.trySend(Packet(generation, peer, bytes)).isSuccess) log("Packet queue full")
     }
 
-    private suspend fun handle(packet: Packet) {
+    private suspend fun handle(raw: Packet) {
         val sim = state.value.simulation
-        if (!packet.peer.verified || sim != (packet.peer.route == Route.SIMULATION)) return
+        if (!raw.peer.verified || sim != (raw.peer.route == Route.SIMULATION)) return
+        // Physical incidents use the unattended internet route when the user configured and enabled it.
+        val packet = if (!sim && state.value.internetDelivery && state.value.backendConfigured)
+            raw.copy(peer = raw.peer.copy(route = Route.INTERNET)) else raw
         val before = incoming.rejected
         val frame = incoming.push(packet.bytes, SystemClock.elapsedRealtime())
         if (incoming.rejected != before) log("Rejected malformed or incomplete frame")
@@ -256,9 +301,66 @@ class Guardian(private val context: Context) {
 
     fun monitor(address: String): Boolean {
         if (state.value.simulation || !state.value.storageReady || !context.canConnect()) return false
-        mutable.update { it.copy(monitoring = true) }
+        if (state.value.monitoring && monitoredAddress == address) return true   // no duplicate GATT session
+        if (state.value.monitoring) physical.stop()
+        monitoredAddress = address
+        mutable.update { it.copy(monitoring = true, recoveryPending = false) }
         physical.start(address)
         return true
+    }
+
+    private var monitoredAddress: String? = null
+
+    /** Persisted user intent; the service / boot receiver / presence callback act on it. */
+    fun setMonitoringRequested(requested: Boolean) = perform {
+        val address = state.value.address
+        withContext(disk) {
+            settings.monitoringRequested = requested
+            if (!requested) settings.recoveryPending = false
+        }
+        val observed = if (requested && address != null) PresenceObservation.start(context, address)
+            else { address?.let { PresenceObservation.stop(context, it) }; false }
+        mutable.update { it.copy(monitoringRequested = requested, presenceObserved = observed,
+            recoveryPending = if (requested) it.recoveryPending else false) }
+    }
+
+    fun configureDelivery(enabled: Boolean, simulationUsesBackend: Boolean) = perform {
+        withContext(disk) {
+            settings.internetDelivery = enabled
+            settings.simulationUsesBackend = simulationUsesBackend
+        }
+        mutable.update { it.copy(internetDelivery = enabled, simulationUsesBackend = simulationUsesBackend) }
+        deliveryKick.trySend(Unit)
+    }
+
+    fun saveBackend(url: String, device: String, secretHex: String) = perform {
+        val ok = withContext(disk) { credentials.save(url, device, secretHex) }
+        mutable.update { it.copy(backendConfigured = ok || it.backendConfigured) }
+        banner(if (ok) "Emergency server credentials stored in the Android Keystore."
+            else "Credentials rejected: HTTPS URL, device id and a 32-128 hex-digit secret are required.")
+    }
+
+    fun clearBackend() = perform {
+        withContext(disk) { credentials.clear() }
+        mutable.update { it.copy(backendConfigured = false) }
+        banner("Emergency server credentials removed.")
+    }
+
+    /** Drains due outbox items once; returns ms until the next due item (null = nothing open). */
+    suspend fun runDeliveryNow(): Long? {
+        if (!state.value.storageReady) return 5_000L
+        val now = System.currentTimeMillis()
+        val updates = withContext(disk) { remote.runOnce(now) }
+        for (update in updates) {
+            val record = withContext(disk) { engine.applyRemote(update) } ?: continue
+            log("${record.route.name} #${record.key.incident}: ${update.note}")
+            if (record.route == Route.SIMULATION || state.value.link == LinkState.READY) reports(record, true)
+            notifyEmergency("SOS · ${record.stage.label}", update.note, record.route == Route.SIMULATION)
+        }
+        mutable.update { it.copy(networkProblem = remote.lastNetworkProblem) }
+        if (updates.isNotEmpty()) refresh()
+        val next = withContext(disk) { remote.nextWakeAt() } ?: return null
+        return (next - System.currentTimeMillis()).coerceAtLeast(0L)
     }
 
     fun stopMonitor() {

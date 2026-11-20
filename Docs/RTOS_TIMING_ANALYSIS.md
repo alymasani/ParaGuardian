@@ -218,3 +218,28 @@ The bridge takes at most four incoming fragments and attempts one outbound fragm
 At default ATT the six-packet SOS requires six transmit opportunities. With an idle scheduling interval of 20 ms that is approximately 120 ms including initial wake alignment, before radio, driver or phone delays. With one negotiated packet it is about one 20 ms opportunity. Each non-blocked wake adds one output packet or advances input by at most four packets. A partial frame expires after 2 seconds. M6 still uses the 10-second application acceptance timeout and independent retry policy.
 
 CubeIDE reported the Release task frame as 240 bytes, versus 184 bytes previously. Debug reported 256 versus 232 bytes. Release bridge receive and transmit frames were 64 and 56 bytes individually. These are compiler static frame sizes and do not measure full nested call paths or high-water usage. Release BSS grew by 664 bytes, including the bridge and diagnostics snapshot. The application has no physical module backend, so no measured radio load or Cortex-M7 timing exists. See the [Milestone 7 validation report](BLE_ANDROID_VALIDATION_REPORT.md) for scope and measurement limitations.
+
+### 4f. StorageTask and Milestone 8 additions
+
+**New task: `StorageTask`.**
+- Priority 20 (`osPriorityBelowNormal4`): below processing (32) and emergency (36), above health (16); enforced by `static_assert`.
+- 768-word (3 KiB) static stack.
+- It sleeps on a task notification (an emergency record was queued) or 50 ms. It runs at most 8 storage units per wake, then yields.
+- **Units and their worst cases** (W25Q128JV datasheet maximums, not measured):
+  - journal commit: 2 page programs, ≤ 6 ms;
+  - log flush: 1 program, ≤ 3 ms;
+  - sector erase: ≤ 400 ms (journal rotation without pre-erase, or log rotation).
+- Because every higher-priority task pre-empts it, flash time never delays acquisition, processing or the SOS countdown.
+- **Worst emergency-record latency** is one unit already in progress (≤ 400 ms) plus the commit. On the host fake flash the measured latency was < 100 ms.
+- **Stack (`-fstack-usage`):** the deepest chain (step → drain → append → advancePage → openSector) is estimated below 1 KB. This must be confirmed with the high-water mark on the target.
+
+**Additions to existing tasks:**
+- **Processing task:** three `FlightRecorder` calls per frame, each rate-limited or on change. Each copies at most 48 B into a locked queue (no flash access, ≤ 96 B of stack).
+- **Emergency task:**
+  - logs events and emergency changes;
+  - runs `PowerManager::update` at 1 Hz (host 0.006 µs);
+  - notifies the storage task;
+  - at boot only, waits at most 2 s (`STORAGE_MOUNT_WAIT_MS`) for the journal mount before `restore()`.
+- **Emergency manager:** the identity hold delays only the FIRST transmission of an incident, and by at most 2 s (`identityHoldMs`).
+- **Locks:** all new critical sections copy at most 56 B. No lock is held across flash I/O or across another lock.
+- **Health task:** runs `TaskSupervisor` (policy only; IWDG not enabled).

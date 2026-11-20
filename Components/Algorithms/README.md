@@ -94,9 +94,11 @@ Commands: `EmergencyAlertTask::Inst().submitCommand(makeEmergencyCommand(...))`.
 
 ## Not implemented (out of scope so far)
 
-Paraglider aerodynamic process model, the Android companion app and a real BLE transport, audio / LED
-hardware backends, flash persistence of incidents, flash logging of safety events, flare guidance.
-They must:
+Status as of Milestone 8 (2026-11-19). The Android companion app (M7) and the portable flash persistence, flash
+logging, power, PCM audio and GPIO LED code (M8) **are implemented** (see the M7 and M8 documents). What remains:
+the paraglider aerodynamic process model, the physical backends that need the schematic (W25Q128 SPI wiring,
+CYW20822 module transport, I2S/SAI audio, LED pins, battery ADC / charger / enable pins) and flare guidance.
+Future algorithm work must:
 
 - take their input from `pg::SafetySnapshot` / `pg::SafetyEvent`, `pg::CrashReport`, `pg::EmergencyStatus`,
   `pg::NavigationEstimate`,
@@ -110,3 +112,11 @@ They must:
 ## Milestone 7 communications
 
 The BLE bridge transports the existing M6 emergency request and reports phone stages back to EmergencyManager. See the [BLE and Android architecture](../../Docs/BLE_ANDROID_ARCHITECTURE.md) and the [companion project](../../Android/ParaGuardian/README.md) for setup and validation.
+
+## Milestone 8 persistence, logging and power
+
+`EmergencyManager` now reports durability honestly (`EmergencyStatus::persist`: queued is not saved) and keeps
+incident ids unique across resets through the `Components/Storage` journal (written by `StorageTask`). Safety
+events, emergency transitions and navigation summaries are logged through `FlightRecorder`. The dispatcher has
+three appended alert kinds (LowBattery, SystemFault, PhoneDisconnected); the M6 priorities are unchanged. See
+[MILESTONE8_SOFTWARE_RELIABILITY_DESIGN.md](../../Docs/MILESTONE8_SOFTWARE_RELIABILITY_DESIGN.md).

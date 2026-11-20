@@ -14,6 +14,7 @@
 #include "Tasks/EmergencyAlertTask.hpp"
 #include "Tasks/SensorAcquisitionTask.hpp"
 #include "Tasks/SensorProcessingTask.hpp"
+#include "Tasks/StorageTask.hpp"
 
 namespace pg {
 // Zero-initialised global; __attribute__((used)) keeps it in the image even if
@@ -48,6 +49,12 @@ void HealthMonitorTask::InitTask()
                                      &tcb_);
     SOAR_ASSERT(rtTaskHandle != nullptr, "HealthMonitorTask: xTaskCreateStatic failed");
     watchTask(rtTaskHandle, "Health");
+    // Heartbeat supervision (policy only; the hardware watchdog is NOT enabled). Timeouts are
+    // well above each task's period because this task samples the counters once a second.
+    supAcq_ = supervisor_.add("SensorAcq", 2000u, pg::TaskCriticality::Critical);
+    supProc_ = supervisor_.add("SensorProc", 2000u, pg::TaskCriticality::Critical);
+    supEmergency_ = supervisor_.add("EmergencyAlert", 2000u, pg::TaskCriticality::Critical);
+    supStorage_ = supervisor_.add("Storage", 5000u, pg::TaskCriticality::Storage);
 }
 
 bool HealthMonitorTask::watchTask(TaskHandle_t handle, const char* name)
@@ -291,6 +298,53 @@ void HealthMonitorTask::collect()
         h.emergencyMaxWakeIntervalMs = es.maxWakeIntervalMs;
         h.emergencyLateWakes = es.lateWakes;
     }
+
+    // ---- storage (Milestone 8) ----
+    StorageTask& sto = StorageTask::Inst();
+    if (sto.status().read(storageCopy_)) {
+        const pg::StorageStatus& ss = storageCopy_;
+        h.journalMount = ss.journalMount;
+        h.criticalLogMount = ss.criticalMount;
+        h.flightLogMount = ss.flightMount;
+        h.journalSequence = ss.journalSequence;
+        h.bootCount = ss.bootCount;
+        h.emergencyCommits = ss.emergencyCommits;
+        h.emergencyCommitFailures = ss.emergencyCommitFailures;
+        h.criticalLogRecords = ss.criticalRecords;
+        h.telemetryLogRecords = ss.telemetryRecords;
+        h.logFailures = ss.logFailures;
+        h.logRecordsLost = ss.recordsLost;
+        h.storageMaxUnitMs = ss.maxUnitMs;
+    }
+    h.logQueueDropsCritical = sto.criticalQueue().dropped;
+    h.logQueueDropsTelemetry = sto.telemetryQueue().dropped;
+    h.emergencyPersist = static_cast<uint8_t>(emergencyCopy_.persist);
+    h.emergencyPersistLatencyMaxMs = emergencyCopy_.persistLatencyMaxMs;
+    h.nextIncidentId = emergencyCopy_.nextIncidentId;
+    // ---- power ----
+    if (emt.power().read(powerCopy_)) {
+        h.batteryLevel = static_cast<uint8_t>(powerCopy_.level);
+        h.chargeState = static_cast<uint8_t>(powerCopy_.charge);
+        h.supplyState = static_cast<uint8_t>(powerCopy_.supply);
+        h.rail5vState = static_cast<uint8_t>(powerCopy_.rail5v);
+        h.amplifierState = static_cast<uint8_t>(powerCopy_.amplifier);
+        h.powerFlags = powerCopy_.flags;
+        h.batteryMillivolts = powerCopy_.millivolts;
+    }
+    // ---- task supervision ----
+    supervisor_.observe(supAcq_, st.cycles, now);
+    supervisor_.observe(supProc_, ps.batches + ps.idleTimeouts, now);
+    supervisor_.observe(supEmergency_, emt.stats().wakes, now);
+    supervisor_.observe(supStorage_, sto.progress(), now);
+    const pg::EmergencyState es = emergencyCopy_.state;
+    const pg::SupervisorContext sctx{es != pg::EmergencyState::Idle && es != pg::EmergencyState::Unavailable,
+                                     emergencyCopy_.persist == pg::PersistState::Committed};
+    const pg::SupervisorVerdict v = supervisor_.evaluate(now, sctx);
+    h.supervisorAction = static_cast<uint8_t>(v.action);
+    h.supervisorStalledMask = v.stalledMask;
+    h.supervisorLateMask = v.lateMask;
+    h.supervisorResetDeferred = v.resetDeferred;
+    h.supervisorStallEvents = v.stallEvents;
 
     h.taskCount = watchedCount_;
     for (uint8_t i = 0; i < watchedCount_; ++i) {

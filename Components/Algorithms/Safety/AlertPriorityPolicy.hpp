@@ -10,9 +10,12 @@
  *    92 SosCommFailure      help may NOT be on its way: the pilot must know
  *    90 SosActive           help is being requested
  *  80-89 landing Critical    imminent terrain contact / extreme descent
+ *    70 LowBattery          battery Critical (Milestone 8)
  *  60-69 landing Warning
+ *    45 LowBattery          battery Low (Milestone 8)
  *  40-49 landing Caution
- *  20-29 landing Advisory, SosAccepted (information)
+ *    30 PhoneDisconnected   in flight, phone link lost (Milestone 8)
+ *  20-29 landing Advisory, SosAccepted (information), SystemFault 22 (Milestone 8)
  * So a long-running advisory can never starve an SOS countdown, and any SOS
  * state outranks every landing warning (after a suspected crash, terrain
  * warnings from a device lying on the ground are noise).
@@ -39,6 +42,14 @@ inline AlertStyle alertStyleFor(AlertKind kind, SafetySeverity sev)
             return AlertStyle{90u, AudioPatternId::SosConfirm, LedPattern::SosBlink, LedColor::Amber, true};
         case AlertKind::SosAccepted:
             return AlertStyle{25u, AudioPatternId::InfoChime, LedPattern::SlowBlink, LedColor::Blue, true};
+        case AlertKind::LowBattery:
+            return sev >= SafetySeverity::Warning
+                       ? AlertStyle{70u, AudioPatternId::WarningTriple, LedPattern::DoubleBlink, LedColor::Red, true}
+                       : AlertStyle{45u, AudioPatternId::CautionDouble, LedPattern::DoubleBlink, LedColor::Amber, true};
+        case AlertKind::PhoneDisconnected:
+            return AlertStyle{30u, AudioPatternId::AdvisoryChime, LedPattern::DoubleBlink, LedColor::Blue, true};
+        case AlertKind::SystemFault:
+            return AlertStyle{22u, AudioPatternId::AdvisoryChime, LedPattern::DoubleBlink, LedColor::Amber, true};
         case AlertKind::None:
         case AlertKind::Count:
             return AlertStyle{0u, AudioPatternId::None, LedPattern::SlowBlink, LedColor::Green, true};

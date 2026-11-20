@@ -1,6 +1,6 @@
 # STM32CubeIDE build output (regenerated on every build)
-Debug/
-Release/
+/Debug/
+/Release/
 
 # Byte-identical macOS Finder duplicates moved out of the build tree
 .finder_duplicates_backup/
@@ -13,3 +13,9 @@ Release/
 
 # macOS Finder metadata
 .DS_Store
+
+# Emergency backend local data / Python caches
+Backend/*.db
+Backend/*.db-wal
+Backend/*.db-shm
+__pycache__/

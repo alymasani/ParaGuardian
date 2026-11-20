@@ -75,6 +75,19 @@ constexpr size_t EMERGENCY_REPORT_DEPTH = 8u;         // transport / phone repor
 constexpr size_t EMERGENCY_EVENT_DEPTH = 8u;          // emergency manager's own events (same task)
 constexpr size_t EMERGENCY_MAX_EVENTS_PER_WAKE = SAFETY_EVENT_QUEUE_DEPTH;   // bounded drain
 
+// ---- Storage (external flash: emergency journal, critical + flight logs) ---------
+// Priority 20: BELOW processing (32) and the emergency task (36), so a page program
+// (~3 ms max) or a sector erase (W25Q128JV tSE max 400 ms) can never delay sampling,
+// processing or an SOS countdown; ABOVE health (16) so diagnostics cannot starve the
+// emergency journal. It sleeps on a notification (emergency record queued) or the
+// idle period; it never busy-waits. See StorageService.hpp for the per-step order.
+constexpr UBaseType_t STORAGE_PRIORITY = static_cast<UBaseType_t>(osPriorityBelowNormal4);  // 20
+constexpr uint32_t STORAGE_STACK_WORDS = 768u;        // 3 KiB: 256 B page buffers on the stack in FlightLog
+constexpr uint32_t STORAGE_IDLE_MS = 50u;             // wake at least this often (telemetry flush timing)
+constexpr size_t STORAGE_CRITICAL_QUEUE_DEPTH = 16u;  // 16 x 56 B
+constexpr size_t STORAGE_TELEMETRY_QUEUE_DEPTH = 32u; // 32 x 56 B (~1 s at the Detailed profile)
+constexpr uint32_t STORAGE_MOUNT_WAIT_MS = 2000u;     // emergency task waits this long for the journal mount
+
 // ---- Health monitor -----------------------------------------------------------
 constexpr UBaseType_t HEALTH_PRIORITY = static_cast<UBaseType_t>(osPriorityBelowNormal);  // 16
 constexpr uint32_t HEALTH_STACK_WORDS = 512u;         // 2 KiB
@@ -92,6 +105,9 @@ static_assert(PROCESSING_PRIORITY > HEALTH_PRIORITY, "processing should run befo
 static_assert(EMERGENCY_PRIORITY < ACQUISITION_PRIORITY, "emergency task must never preempt acquisition");
 static_assert(EMERGENCY_PRIORITY > PROCESSING_PRIORITY, "a processing overload must not starve the SOS countdown");
 static_assert(EMERGENCY_STACK_WORDS >= configMINIMAL_STACK_SIZE, "stack too small");
+static_assert(STORAGE_PRIORITY < PROCESSING_PRIORITY, "flash work must never delay processing");
+static_assert(STORAGE_PRIORITY > HEALTH_PRIORITY, "diagnostics must not starve the emergency journal");
+static_assert(STORAGE_STACK_WORDS >= configMINIMAL_STACK_SIZE, "stack too small");
 static_assert(PROCESSING_STACK_WORDS >= configMINIMAL_STACK_SIZE, "stack too small");
 static_assert(ACQUISITION_STACK_WORDS >= configMINIMAL_STACK_SIZE, "stack too small");
 static_assert(HEALTH_STACK_WORDS >= configMINIMAL_STACK_SIZE, "stack too small");

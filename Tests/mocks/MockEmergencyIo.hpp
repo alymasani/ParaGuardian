@@ -45,27 +45,80 @@ struct SosTransport final : pg::ISosTransport {
 };
 
 /// RAM "persistence" (survives a simulated reset because the test keeps the object).
+/// Synchronous by default (save() returns Committed). async = true models the real
+/// queued store: save() returns Queued and nothing is durable until commitPending().
 struct EmergencyStore final : pg::IEmergencyStore {
     bool avail = true;
     bool failWrites = false;
+    bool async = false;
     bool has = false;
+    bool corrupt = false;      ///< mountState() reports Corrupt (data present, nothing valid)
     uint8_t bytes[pg::kEmergencyRecordBytes] = {};
-    uint32_t writes = 0;
+    bool hasPending = false;
+    uint8_t pending[pg::kEmergencyRecordBytes] = {};
+    bool hasUncommitted = false;
+    uint8_t uncommitted[pg::kEmergencyRecordBytes] = {};
+    uint32_t writes = 0;       ///< committed records
+    uint32_t saves = 0;        ///< save() calls accepted
+    uint32_t ticket = 0, committed = 0, failed = 0;
     bool available() const override { return avail; }
+    pg::StoreMount mountState() const override
+    {
+        if (!avail) return pg::StoreMount::Unavailable;
+        if (has) return pg::StoreMount::Recovered;
+        return corrupt ? pg::StoreMount::Corrupt : pg::StoreMount::Blank;
+    }
     bool load(uint8_t* dst, size_t len) override
     {
         if (!has || len != sizeof(bytes)) return false;
         std::memcpy(dst, bytes, len);
         return true;
     }
-    bool save(const uint8_t* src, size_t len) override
+    bool loadUncommitted(uint8_t* dst, size_t len) override
     {
-        if (failWrites || len != sizeof(bytes)) return false;
+        if (!hasUncommitted || len != sizeof(uncommitted)) return false;
+        std::memcpy(dst, uncommitted, len);
+        return true;
+    }
+    pg::PersistAck save(const uint8_t* src, size_t len, uint32_t& t) override
+    {
+        if (!avail || len != sizeof(bytes)) return pg::PersistAck::Rejected;
+        t = ++ticket;
+        ++saves;
+        if (async) {
+            std::memcpy(pending, src, len);
+            hasPending = true;
+            return pg::PersistAck::Queued;
+        }
+        if (failWrites) {
+            failed = t;
+            return pg::PersistAck::Rejected;
+        }
         std::memcpy(bytes, src, len);
         has = true;
         ++writes;
+        committed = t;
+        return pg::PersistAck::Committed;
+    }
+    /// The (simulated) storage task commits the newest pending record.
+    bool commitPending()
+    {
+        if (!hasPending) return false;
+        if (failWrites) {
+            failed = ticket;
+            return false;
+        }
+        std::memcpy(bytes, pending, sizeof(bytes));
+        has = true;
+        hasPending = false;
+        ++writes;
+        committed = ticket;
         return true;
     }
+    /// A reset: RAM-only state (the queue) is lost.
+    void reset() { hasPending = false; }
+    uint32_t committedTicket() const override { return committed; }
+    uint32_t failedTicket() const override { return failed; }
 };
 
 struct AudioAlert final : pg::IAudioAlert {
